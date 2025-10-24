@@ -96,7 +96,7 @@ Metrics:
 ```bibtex
 @article{NovaNet2025,
   title={NovaNet: Orbit-Aware Energy-based Spatio-Temporal PCGNN for LEO Satellite Handover},
-  author={Jia Bi, Haochen Liu, Ting Liu},
+  author={Jia Bi, Haochen Liu, Ting Liu, Samuel Pinilla, Bohan Li,Luping Xiang, Jian Xie, Mingliang Tao, Ling Wang},
   journal={IEEE TWC (Under Review)},
   year={2025}
 }
