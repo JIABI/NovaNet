@@ -18,6 +18,10 @@ NovaNet integrates **Point-Cloud-inspired dynamic graph construction** with **Sp
 
 **NovaNet** = **Dynamic Point-Cloud Graph Construction + Orbit-Aware Spatio-Temporal GNN + Energy-based Objective**
 
+<p align="center">
+  <img src="Liu2.jpg" alt="LibraKAN Architecture" width="720"/>
+</p>
+
 - **Point-Cloud Graph Builder** (`PCGraphBuilder`):  
   Treats candidate satellites as a small point cloud. Dynamically learns adjacency (UE–Sat and Sat–Sat) instead of fixed KNN/threshold rules.
 
