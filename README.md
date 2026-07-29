@@ -27,6 +27,13 @@ record is in [`CODE_PAPER_ALIGNMENT.md`](CODE_PAPER_ALIGNMENT.md).
 
 ## Canonical paper configuration
 
+<p align="center">
+  <img src="Liu2.jpg" alt="LibraKAN Architecture" width="720"/>
+</p>
+
+- **Point-Cloud Graph Builder** (`PCGraphBuilder`):  
+  Treats candidate satellites as a small point cloud. Dynamically learns adjacency (UE–Sat and Sat–Sat) instead of fixed KNN/threshold rules.
+
 Every entry point reads [`configs/paper.yaml`](configs/paper.yaml). Important
 values are:
 
@@ -275,5 +282,13 @@ tests/                             numerical and consistency tests
 
 ## Citation
 
-Please use the final IEEE TWC bibliographic record after acceptance. Do not
-cite an “under review” placeholder as a published article.
+```bibtex
+@article{NovaNet2025,
+  title={NovaNet: Orbit-Aware Energy-based Spatio-Temporal PCGNN for LEO Satellite Handover},
+  author={Jia Bi, Haochen Liu, Ting Liu, Samuel Pinilla, Bohan Li,Luping Xiang, Jian Xie, Mingliang Tao, Ling Wang},
+  journal={IEEE TWC (Under Review)},
+  year={2025}
+}
+```
+
+Please update this record with the final IEEE TWC bibliographic reference after acceptance.
