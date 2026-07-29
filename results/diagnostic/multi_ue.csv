@@ -1,0 +1,6 @@
+users,method,mean_throughput_mbps,p05_throughput_mbps,jain_index,blocking_percent,handovers_per_ue,hof_percent,satellite_capacity_mbps,max_users_per_satellite,minimum_admission_rate_mbps,scheduler,association_update,region_radius_km,epochs
+5,Max-Elevation-LB,0.0,0.0,0.0,100.0,0.0,0.0,1200.0,32,10.0,proportional_fair,synchronous_two_phase,500.0,1
+5,Max-ServeTime-LB,20.543628692626953,4.5989635467529295,0.792617532593599,20.0,0.0,0.0,1200.0,32,10.0,proportional_fair,synchronous_two_phase,500.0,1
+5,Skip-1-LB,0.0,0.0,0.0,100.0,0.0,0.0,1200.0,32,10.0,proportional_fair,synchronous_two_phase,500.0,1
+5,Rate-Dwell-LB,23.6900972366333,17.18483772277832,0.9643534184455148,0.0,0.0,0.0,1200.0,32,10.0,proportional_fair,synchronous_two_phase,500.0,1
+5,NovaNet-LB,15.944665145874023,0.0,0.5957935521419021,40.0,0.0,0.0,1200.0,32,10.0,proportional_fair,synchronous_two_phase,500.0,1

@@ -1,0 +1,107 @@
+schema_version: 2
+
+experiment:
+  seed: 2025
+  tle_path: starlink.tle
+  tle_selection: shell_stratified_orbit_balanced_nested
+  start_utc: "2023-05-01T09:30:00+00:00"
+  duration_s: 2400
+  decision_interval_s: 30
+  geometry_subsample_s: 5
+  minimum_elevation_deg: 10.0
+  candidate_cap: 8
+  num_satellites: 60
+  ue_latitude_deg: [-60.0, 60.0]
+  ue_longitude_deg: [-180.0, 180.0]
+  ue_altitude_m: 0.0
+
+channel:
+  carrier_hz: 12000000000.0
+  bandwidth_hz: 20000000.0
+  bandwidth_options_hz: [20000000.0, 100000000.0]
+  eirp_density_dbw_mhz: 34.0
+  ue_antenna_gain_dbi: 0.0
+  system_noise_temperature_k: 290.0
+  implementation_efficiency: 0.75
+  outage_threshold_db: 0.0
+  minimum_rate_bps: 100000.0
+  gaseous_zenith_loss_db: 0.12
+  rain_rate_mm_h: 8.0
+  rain_specific_attenuation_db_km: 0.018
+  rician_k_db: 15.0
+  shadowing_std_db: 1.5
+  measurement_iir_alpha: 0.5
+  measurement_interval_s: 30
+  nominal_measurement_std_db: 0.5
+  doppler_tracking_efficiency: 0.995
+  doppler_estimation_std_hz: 25.0
+  coherent_integration_s: 1.00e-4
+
+handover:
+  ttt_s: 0.100
+  execution_s: 0.150
+  statistics_window_s: 60
+  hysteresis_db: 1.5
+  freeze_steps: 1
+  failure_outage_fraction: 0.5
+
+planner:
+  horizon_steps: 6
+  temperature: 1.0
+  lcb_kappa: 1.5
+  rate_weight: 1.0
+  dwell_weight: 0.35
+  base_switch_cost: 1.0
+  retained_dwell_weight: 0.50
+  angular_speed_weight: 0.25
+  hof_weight: 1.50
+  load_weight: 0.50
+
+model:
+  ue_feature_dim: 4
+  node_feature_dim: 9
+  transition_feature_dim: 3
+  hidden_dim: 128
+  gnn_layers: 2
+  graph_neighbors: 4
+  adjacency_temperature: 1.0
+
+training:
+  num_samples: 3600
+  epochs: 100
+  batch_size: 64
+  num_workers: 0
+  learning_rate: 1.00e-3
+  weight_decay: 1.00e-4
+  gradient_clip: 1.0
+  use_amp: false
+  snr_nll_weight: 0.20
+  ttl_weight: 1.00
+  hof_weight: 0.50
+  path_weight: 0.50
+  selection_weight: 0.20
+  entropy_weight: 0.01
+  handover_weight_init: 1.0
+  handover_weight_max: 30.0
+  dual_step: 0.05
+  target_switch_rate: 0.04
+  checkpoint_path: checkpoints/novanet_paper.pt
+
+traffic:
+  packet_size_bytes: 1500
+  arrival_process: poisson
+  arrival_rate_packets_s: 500.0
+  queue_discipline: fifo
+  queue_capacity_packets: 4096
+  fixed_network_delay_ms: 33.5
+  protocol_processing_ms: 1.0
+
+multi_ue:
+  satellite_capacity_mbps: 1200.0
+  max_users_per_satellite: 32
+  minimum_admission_rate_mbps: 10.0
+  scheduler: proportional_fair
+  association_update: synchronous_two_phase
+  region_center_lat_deg: 51.5
+  region_center_lon_deg: 0.0
+  region_radius_km: 500.0

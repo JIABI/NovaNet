@@ -1,0 +1,20 @@
+{
+  "config_fingerprint": "814db9d6a32562e0",
+  "best_validation_loss": 1030.849609375,
+  "samples": 16,
+  "train_samples": 12,
+  "validation_samples": 4,
+  "allow_stale_tle": true,
+  "tle_provenance": {
+    "tle_path": "/Users/bella/Downloads/NovaNet__Orbit_Aware_Structured_Decision_Learning_for_Reliable_Handover_in_LEO_Constellations__Copy_/code/NovaNet/starlink.tle",
+    "tle_sha256": "13de17ac407e7c232c1e365c3e70687db9c7cce6f7f29ec4fb22970083a35086",
+    "tle_records": 8145,
+    "tle_selection": "shell_stratified_orbit_balanced_nested",
+    "selected_satellites": 60,
+    "selected_names_sha256": "efc9514afdee968e7d0bcd09474cfd7cd2e93c0e93e970051442b377cac8ab72",
+    "selected_shell_count": 11,
+    "simulation_start_utc": "2023-05-01T09:30:00+00:00",
+    "median_tle_epoch_utc": "2025-08-31T03:18:20.777472+00:00",
+    "absolute_age_days": 852.7419071466667
+  }
+}

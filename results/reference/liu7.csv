@@ -1,0 +1,7 @@
+method,queue_and_serialization_ms,shared_protocol_processing_ms,reported_transmission_only_ms
+Max-Elevation,2.982,1.000,3.982
+Max-ServeTime,8.201,1.000,9.201
+GNN-only,7.072,1.000,8.072
+DQN+GNN,5.943,1.000,6.943
+NovaNet (Ours),3.521,1.000,4.521
+

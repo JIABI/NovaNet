@@ -1,0 +1,2 @@
+density,candidate_cap,seed,best_five_epoch_validation_loss,converged,convergence_epoch
+60,8,2025,689.8302673339844,True,5

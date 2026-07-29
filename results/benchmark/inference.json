@@ -1,0 +1,37 @@
+{
+  "scope": "neural encoder, learned adjacency, heads, and Soft-DP; ephemeris/feature construction excluded",
+  "threads": 1,
+  "warmup": 100,
+  "repetitions": 1000,
+  "platform": "macOS-14.7.6-arm64-arm-64bit",
+  "processor": "arm",
+  "python": "3.12.0",
+  "torch": "2.5.1",
+  "config_fingerprint": "814db9d6a32562e0",
+  "results": [
+    {
+      "candidate_cap": 8,
+      "parameters": 266380,
+      "trainable_parameters": 266379,
+      "mean_ms": 1.6424581120000001,
+      "median_ms": 1.5112085,
+      "p95_ms": 2.238375
+    },
+    {
+      "candidate_cap": 16,
+      "parameters": 266380,
+      "trainable_parameters": 266379,
+      "mean_ms": 3.0048786059999997,
+      "median_ms": 2.853854,
+      "p95_ms": 3.781459
+    },
+    {
+      "candidate_cap": 32,
+      "parameters": 266380,
+      "trainable_parameters": 266379,
+      "mean_ms": 9.017091692,
+      "median_ms": 8.7515205,
+      "p95_ms": 10.949917
+    }
+  ]
+}
