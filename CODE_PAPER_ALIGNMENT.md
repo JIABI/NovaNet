@@ -2,7 +2,7 @@
 
 This file records what the revised repository implements and what is still
 needed to reproduce the manuscript's numerical tables. The canonical
-configuration fingerprint is `814db9d6a32562e0`.
+configuration fingerprint is `6e41ada1a4d5a443`.
 
 | Reviewer concern | Implemented artifact | Verification |
 |---|---|---|
@@ -14,20 +14,20 @@ configuration fingerprint is `814db9d6a32562e0`.
 | 300 km/h setup lacked a physical model | `experiments/aerial_doppler.py` records 1 km altitude, four headings, radial-velocity Doppler, tracking efficiency, residual error, and coherent interval | channel Doppler tests |
 | Multi-UE mechanics were missing | `experiments/multi_ue.py` and `novanet/multi_ue.py` specify a 500 km disk, capacity/admission constraints, synchronous ranking/commit, PF allocation, load snapshots, and per-UE report updates | scheduler unit test and a five-UE diagnostic run |
 | Latency model was not reproducible | `novanet/latency.py` implements Poisson arrivals, finite drop-tail FIFO, work-conserving service, preemptive CHO blackouts, serialization, 33.5 ms network delay, and shared 1 ms protocol processing | deterministic, blackout, and overflow tests |
-| Risk energy and losses were unclosed | `novanet/model.py`, `novanet/handover.py`, and `novanet/losses.py` implement switch-gated dimensionless cost, pairwise HOF head/BCE, independent angular-speed cost, all claimed losses, and executable ablations | head-gradient, HOF event-grid, and `TransVel` tests |
+| Risk energy and losses were unclosed | `novanet/model.py`, `novanet/handover.py`, and `novanet/losses.py` implement the six-dimensional Eq. (24) interface, direct propagated TTL, fixed-reference utility, Eq. (17) transition cost, pairwise HOF head/BCE, residual NLL, path KL, and L2 regularization | direct-TTL, exact-transition, head-gradient, and HOF event-grid tests |
 | Communication assumptions were incomplete | `novanet/channel.py` implements the 12 GHz link budget, common EIRP density, gas/rain approximation, Rician/shadowing terms, measurement filtering, Doppler compensation, and tracking loss | geometry/channel tests |
 
 ## Checks completed
 
-- 17 tests pass.
+- 18 tests pass.
 - One-epoch training, checkpoint save, provenance validation, checkpoint load,
   and one-user evaluation complete successfully in diagnostic mode.
 - The multi-UE pipeline completes a five-UE/one-epoch diagnostic run.
 - Every experiment entry point accepts `--help`, and the package builds as a
   wheel without downloading dependencies.
-- The measured one-thread neural forward means are 1.64/3.00/9.02 ms for
-  K=8/16/32 (100 warm-up, 1,000 measured passes); metadata is stored in
-  `results/benchmark/inference.json`.
+- The checked-in inference JSON predates the six-feature/direct-TTL model and
+  is retained only as a historical artifact. It must be regenerated before
+  manuscript timing or parameter-count claims are made.
 
 ## Reproduction blockers
 

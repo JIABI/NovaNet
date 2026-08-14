@@ -38,35 +38,10 @@ def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict:
     return {key: value.to(device) for key, value in batch.items()}
 
 
-@torch.no_grad()
-def fit_energy_statistics(model: NovaNet, loader: DataLoader) -> None:
-    rates, ttls, angular, masks = [], [], [], []
-    cfg = model.config
-    for batch in loader:
-        snr = batch["snr_target_db"]
-        rate = (
-            cfg.channel.implementation_efficiency
-            * cfg.channel.bandwidth_hz
-            * torch.log2(1.0 + torch.pow(10.0, snr / 10.0))
-            / 1e6
-        )
-        rates.append(rate)
-        ttls.append(batch["ttl_target_s"])
-        angular.append(batch["angular_speed_deg_s"])
-        masks.append(batch["valid_mask"])
-    model.energy.normalizer.fit(
-        torch.cat(rates),
-        torch.cat(ttls),
-        torch.cat(angular),
-        torch.cat(masks),
-    )
-
-
 def run_epoch(
     model: NovaNet,
     loader: DataLoader,
     device: torch.device,
-    handover_weight: float,
     optimizer: torch.optim.Optimizer | None,
     gradient_clip: float,
 ) -> dict[str, float]:
@@ -84,11 +59,10 @@ def run_epoch(
                 batch["spatial_adjacency"],
                 batch["valid_mask"],
                 batch["current_idx"],
-                batch["angular_speed_deg_s"],
+                batch["ttl_s"],
+                batch["nominal_snr_db"],
             )
-            loss, components = compute_training_loss(
-                outputs, batch, model, handover_weight
-            )
+            loss, components = compute_training_loss(outputs, batch, model)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite training loss")
             if optimizer is not None:
@@ -151,12 +125,12 @@ def main() -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = NovaNet(cfg)
-    fit_energy_statistics(model, train_loader)
     model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.training.learning_rate,
-        weight_decay=cfg.training.weight_decay,
+        # The manuscript objective includes L2 explicitly in the loss.
+        weight_decay=0.0,
     )
 
     output = Path(args.output or cfg.training.checkpoint_path)
@@ -165,14 +139,12 @@ def main() -> int:
     metadata_path = output.with_suffix(".metadata.json")
     epochs = args.epochs or cfg.training.epochs
     best_validation = float("inf")
-    handover_weight = cfg.training.handover_weight_init
     rows: list[dict[str, float | int]] = []
     for epoch in range(1, epochs + 1):
         train_metrics = run_epoch(
             model,
             train_loader,
             device,
-            handover_weight,
             optimizer,
             cfg.training.gradient_clip,
         )
@@ -181,24 +153,10 @@ def main() -> int:
                 model,
                 validation_loader,
                 device,
-                handover_weight,
                 None,
                 cfg.training.gradient_clip,
             )
-        observed_switch = train_metrics["handover"]
-        handover_weight = float(
-            np.clip(
-                handover_weight
-                + cfg.training.dual_step
-                * (observed_switch - cfg.training.target_switch_rate),
-                0.0,
-                cfg.training.handover_weight_max,
-            )
-        )
-        row: dict[str, float | int] = {
-            "epoch": epoch,
-            "handover_weight": handover_weight,
-        }
+        row: dict[str, float | int] = {"epoch": epoch}
         row.update({f"train_{key}": value for key, value in train_metrics.items()})
         row.update(
             {f"validation_{key}": value for key, value in validation_metrics.items()}
@@ -206,8 +164,7 @@ def main() -> int:
         rows.append(row)
         print(
             f"epoch={epoch:03d} train={train_metrics['total']:.5f} "
-            f"validation={validation_metrics['total']:.5f} "
-            f"switch={observed_switch:.4f} dual={handover_weight:.4f}",
+            f"validation={validation_metrics['total']:.5f}",
             flush=True,
         )
         if validation_metrics["total"] < best_validation:
@@ -219,7 +176,6 @@ def main() -> int:
                     "config_fingerprint": cfg.fingerprint,
                     "epoch": epoch,
                     "validation": validation_metrics,
-                    "handover_weight": handover_weight,
                     "tle_provenance": tle_provenance,
                 },
                 output,

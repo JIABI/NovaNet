@@ -1,6 +1,6 @@
 # NovaNet
 
-This repository is the reproducible implementation of **NovaNet: Orbit-Aware
+This repository is the synchronized reference implementation of **NovaNet: Orbit-Aware
 Structured Decision Learning for Reliable Handover in LEO Constellations**.
 The current code uses one configuration, one link/CHO simulator, and one
 finite-horizon planner across training and evaluation.
@@ -27,13 +27,6 @@ record is in [`CODE_PAPER_ALIGNMENT.md`](CODE_PAPER_ALIGNMENT.md).
 
 ## Canonical paper configuration
 
-<p align="center">
-  <img src="Liu2.jpg" alt="LibraKAN Architecture" width="720"/>
-</p>
-
-- **Point-Cloud Graph Builder** (`PCGraphBuilder`):  
-  Treats candidate satellites as a small point cloud. Dynamically learns adjacency (UE–Sat and Sat–Sat) instead of fixed KNN/threshold rules.
-
 Every entry point reads [`configs/paper.yaml`](configs/paper.yaml). Important
 values are:
 
@@ -51,7 +44,11 @@ values are:
 | bandwidth | 20 / 100 MHz |
 | carrier | 12 GHz |
 | planning horizon | 6 decisions (180 s) |
-| node features | 9 (6 geometry + 3 measurement) |
+| node features | 6 (elevation/rate, range/rate, direct TTL, causal SINR) |
+| energy references | R_ref = 50 Mbps; T_ref = 600 s |
+| energy coefficients | alpha = 1, beta = 0.35, c0 = 1, c1 = 0.5, c2 = 1.5 |
+| pairwise CHO context | 5 (TTT, execution, hysteresis, threshold, failure fraction) |
+| trainable parameters | 249,603 |
 | multi-UE load coefficient | 0.5 (frozen, shared after score standardization) |
 
 `config.py` exposes the same values under legacy constant names. It is not a
@@ -73,16 +70,15 @@ second configuration.
   rate/dwell fail-safe; a current no-coverage epoch is recorded as zero
   service and outage rather than silently dropped.
 - `novanet/model.py` contains a geometry-prior-gated learned adjacency, a
-  satellite-ID-aligned recurrent state, SNR mean/variance, TTL, selection, and
-  pairwise HOF heads. Every manuscript ablation is an executable switch.
-  Transition cost has separately ablatable retained-dwell,
-  apparent-angular-speed, and HOF terms, and its diagonal is exactly zero.
-- `novanet/losses.py` trains all claimed heads: Gaussian SNR NLL, TTL Huber,
-  HOF BCE, sequence-policy KL, selection CE, expected-handover penalty, and
-  entropy sharpening.
-- Rate, TTL, and angular speed are converted to dimensionless terms using
-  training-split statistics stored in the checkpoint. The simulator uses the
-  same switch indicator as the model.
+  satellite-ID-aligned recurrent state, log-SINR-residual mean/variance heads,
+  and a pairwise HOF head. TTL is propagated directly by TLE/SGP4 and passed to
+  the planner; there is no learned TTL head. The transition cost is exactly
+  `1[i != j] (c0 + c1 Tbar_i + c2 pHOF_ij)`.
+- `novanet/losses.py` implements the manuscript objective: residual Gaussian
+  NLL, pairwise HOF BCE, sequence-policy KL, and explicit L2 regularization.
+- Rate and TTL use the fixed configuration references `R_ref` and `T_ref`.
+  Energy coefficients are fixed validation-selected configuration values,
+  rather than trainable softplus weights or checkpoint-fitted z-scores.
 - `novanet/channel.py` implements the 12 GHz link budget, the documented
   elevation-dependent gas/rain slant-path approximation, controlled excess
   attenuation, Rician/shadowing variation, Doppler, residual tracking error,
@@ -145,8 +141,8 @@ throughput, HO, HOF, outage, transmission-only latency, end-to-end quantiles,
 and CHO occupancy are obtained in one run from the same events.
 
 Every accepted checkpoint records the complete configuration fingerprint,
-the exact TLE SHA-256/epoch/subset metadata, frozen energy-normalization
-statistics, and validation metrics. Evaluation rejects a checkpoint trained
+the exact TLE SHA-256/epoch/subset metadata, and validation metrics.
+Evaluation rejects a checkpoint trained
 on a different configuration or TLE.
 
 ## Reviewer-requested experiments
@@ -171,7 +167,7 @@ All tags in the manuscript are executable switches:
 
 ```bash
 python -m experiments.ablation \
-  --variants Full,OrbitPrior,DynAdj,Temporal,Planner,UncLCB,TransTTL,TransVel,TransHOF
+  --variants Full,OrbitPrior,DynAdj,Temporal,Planner,UncLCB,TransTTL,TransHOF
 ```
 
 ### Estimation-variance sensitivity
@@ -282,13 +278,5 @@ tests/                             numerical and consistency tests
 
 ## Citation
 
-```bibtex
-@article{NovaNet2025,
-  title={NovaNet: Orbit-Aware Energy-based Spatio-Temporal PCGNN for LEO Satellite Handover},
-  author={Jia Bi, Haochen Liu, Ting Liu, Samuel Pinilla, Bohan Li,Luping Xiang, Jian Xie, Mingliang Tao, Ling Wang},
-  journal={IEEE TWC (Under Review)},
-  year={2025}
-}
-```
-
-Please update this record with the final IEEE TWC bibliographic reference after acceptance.
+Please use the final IEEE TWC bibliographic record after acceptance. Do not
+cite an “under review” placeholder as a published article.
