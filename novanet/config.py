@@ -4,16 +4,39 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
+import sysconfig
 from typing import Any, TypeVar
 
 import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "paper.yaml"
+PACKAGED_DATA_ROOT = Path(sysconfig.get_path("data")) / "share" / "novanet"
+
+
+def _select_default_config_path(
+    repository_root: Path = REPO_ROOT,
+    packaged_data_root: Path = PACKAGED_DATA_ROOT,
+) -> Path:
+    """Prefer a source checkout, then the wheel-installed data directory."""
+
+    source = repository_root / "configs" / "paper.yaml"
+    installed = packaged_data_root / "configs" / "paper.yaml"
+    if source.is_file():
+        return source
+    if installed.is_file():
+        return installed
+    # Retain the source-shaped path so the eventual FileNotFoundError names
+    # the asset expected in a development checkout.
+    return source
+
+
+DEFAULT_CONFIG_PATH = _select_default_config_path()
+DEFAULT_DATA_ROOT = DEFAULT_CONFIG_PATH.parent.parent
 T = TypeVar("T")
 
 
@@ -40,7 +63,9 @@ class ChannelConfig:
     bandwidth_hz: float
     bandwidth_options_hz: tuple[float, ...]
     eirp_density_dbw_mhz: float
+    ue_antenna_elements: int
     ue_antenna_gain_dbi: float
+    exogenous_interference_power_w: float
     system_noise_temperature_k: float
     implementation_efficiency: float
     outage_threshold_db: float
@@ -85,20 +110,46 @@ class HandoverConfig:
     hysteresis_db: float
     freeze_steps: int
     failure_outage_fraction: float
+    event_step_s: float
 
 
 @dataclass(frozen=True)
 class PlannerConfig:
     horizon_steps: int
     temperature: float
+    policy_temperature: float
+    teacher_temperature: float
     lcb_kappa: float
-    rate_weight: float
-    dwell_weight: float
-    base_switch_cost: float
-    retained_dwell_weight: float
-    angular_speed_weight: float
-    hof_weight: float
+    rate_reference_mbps: float
+    ttl_reference_s: float
+    alpha: float
+    beta: float
+    c0: float
+    c1: float
+    c2: float
     load_weight: float
+
+    # Read-only aliases keep the baseline/evaluation helpers source-compatible
+    # while the canonical configuration uses the notation of Eqs. (15)--(17).
+    @property
+    def rate_weight(self) -> float:
+        return self.alpha
+
+    @property
+    def dwell_weight(self) -> float:
+        return self.beta
+
+    @property
+    def base_switch_cost(self) -> float:
+        return self.c0
+
+    @property
+    def retained_dwell_weight(self) -> float:
+        return self.c1
+
+    @property
+    def hof_weight(self) -> float:
+        return self.c2
 
 
 @dataclass(frozen=True)
@@ -110,6 +161,11 @@ class ModelConfig:
     gnn_layers: int
     graph_neighbors: int
     adjacency_temperature: float
+    elevation_reference_deg: float
+    elevation_rate_reference_deg_s: float
+    range_reference_m: float
+    range_rate_reference_m_s: float
+    sinr_reference_db: float
 
 
 @dataclass(frozen=True)
@@ -122,16 +178,9 @@ class TrainingConfig:
     weight_decay: float
     gradient_clip: float
     use_amp: bool
-    snr_nll_weight: float
-    ttl_weight: float
+    nll_weight: float
     hof_weight: float
     path_weight: float
-    selection_weight: float
-    entropy_weight: float
-    handover_weight_init: float
-    handover_weight_max: float
-    dual_step: float
-    target_switch_rate: float
     checkpoint_path: str
 
 
@@ -156,6 +205,7 @@ class MultiUEConfig:
     region_center_lat_deg: float
     region_center_lon_deg: float
     region_radius_km: float
+    blocking_cost: float | None
 
 
 @dataclass(frozen=True)
@@ -181,7 +231,16 @@ class NovaNetConfig:
 
     def resolve_tle_path(self) -> Path:
         path = Path(self.experiment.tle_path)
-        return path if path.is_absolute() else REPO_ROOT / path
+        if path.is_absolute():
+            return path
+        candidates = (REPO_ROOT / path, DEFAULT_DATA_ROOT / path)
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        # Match the selected default-config location in the error path.  This
+        # makes an incomplete installed wheel fail at its packaged data root
+        # rather than at an unrelated site-packages parent.
+        return DEFAULT_DATA_ROOT / path
 
     def validate(self) -> None:
         exp, ch, ho, plan = (
@@ -190,8 +249,8 @@ class NovaNetConfig:
             self.handover,
             self.planner,
         )
-        if self.schema_version != 2:
-            raise ValueError("Unsupported config schema; expected schema_version=2")
+        if self.schema_version != 5:
+            raise ValueError("Unsupported config schema; expected schema_version=5")
         if not 0.0 <= exp.minimum_elevation_deg < 90.0:
             raise ValueError("minimum_elevation_deg must be in [0, 90)")
         if exp.candidate_cap < 2 or exp.candidate_cap > exp.num_satellites:
@@ -211,10 +270,23 @@ class NovaNetConfig:
             raise ValueError(
                 "positive geometry_subsample_s must divide decision_interval_s"
             )
-        if ho.ttt_s <= 0.0 or ho.execution_s <= 0.0:
+        if (
+            not math.isfinite(ho.ttt_s)
+            or not math.isfinite(ho.execution_s)
+            or ho.ttt_s <= 0.0
+            or ho.execution_s <= 0.0
+        ):
             raise ValueError("CHO TTT and execution duration must be positive")
+        if not math.isfinite(ho.hysteresis_db):
+            raise ValueError("handover hysteresis must be finite")
+        if not 0.0 <= ho.failure_outage_fraction < 1.0 or not math.isfinite(
+            ho.failure_outage_fraction
+        ):
+            raise ValueError("failure_outage_fraction must be finite and in [0,1)")
         if ho.freeze_steps < 0:
             raise ValueError("freeze_steps cannot be negative")
+        if not math.isfinite(ch.outage_threshold_db):
+            raise ValueError("outage_threshold_db must be finite")
         if not ch.bandwidth_options_hz or any(
             bandwidth <= 0.0 for bandwidth in ch.bandwidth_options_hz
         ):
@@ -223,10 +295,46 @@ class NovaNetConfig:
             raise ValueError("implementation_efficiency must be in (0, 1]")
         if not 0.0 <= ch.measurement_iir_alpha <= 1.0:
             raise ValueError("measurement_iir_alpha must be in [0, 1]")
+        if ch.ue_antenna_elements < 1:
+            raise ValueError("ue_antenna_elements must be positive")
+        if ch.exogenous_interference_power_w < 0.0:
+            raise ValueError("exogenous_interference_power_w cannot be negative")
+        if ho.event_step_s <= 0.0:
+            raise ValueError("event_step_s must be positive")
+        for interval_name, interval_s in (
+            ("TTT", ho.ttt_s),
+            ("CHO execution interval", ho.execution_s),
+        ):
+            samples = interval_s / ho.event_step_s
+            if not math.isclose(
+                samples, round(samples), abs_tol=1e-9
+            ):
+                raise ValueError(f"event_step_s must divide the {interval_name}")
         if plan.horizon_steps < 2:
             raise ValueError("Finite-horizon DP requires horizon_steps >= 2")
-        if plan.temperature <= 0.0:
-            raise ValueError("Soft-DP temperature must be positive")
+        if min(
+            plan.temperature,
+            plan.policy_temperature,
+            plan.teacher_temperature,
+        ) <= 0.0:
+            raise ValueError("DP, policy, and teacher temperatures must be positive")
+        if plan.rate_reference_mbps <= 0.0 or plan.ttl_reference_s <= 0.0:
+            raise ValueError("R_ref and T_ref must be positive")
+        if min(plan.alpha, plan.beta, plan.c0, plan.c1, plan.c2) < 0.0:
+            raise ValueError("Energy coefficients must be nonnegative")
+        if self.model.node_feature_dim != 6:
+            raise ValueError("Eq. (24) requires exactly six node features")
+        if self.model.transition_feature_dim != 5:
+            raise ValueError("The CHO context has five configured quantities")
+        preprocessing_scales = (
+            self.model.elevation_reference_deg,
+            self.model.elevation_rate_reference_deg_s,
+            self.model.range_reference_m,
+            self.model.range_rate_reference_m_s,
+            self.model.sinr_reference_db,
+        )
+        if any(scale <= 0.0 for scale in preprocessing_scales):
+            raise ValueError("Node-feature reference scales must be positive")
         if self.traffic.arrival_process != "poisson":
             raise ValueError("The reproducible paper latency model uses Poisson arrivals")
         if self.traffic.queue_discipline != "fifo":
@@ -237,6 +345,33 @@ class NovaNetConfig:
             raise ValueError("packet_size_bytes must be positive")
         if self.traffic.queue_capacity_packets < 1:
             raise ValueError("queue_capacity_packets must be positive")
+        if (
+            self.multi_ue.blocking_cost is not None
+            and (
+                not math.isfinite(self.multi_ue.blocking_cost)
+                or self.multi_ue.blocking_cost < 0.0
+            )
+        ):
+            raise ValueError(
+                "multi_ue.blocking_cost must be finite, nonnegative, or null"
+            )
+        if (
+            not math.isfinite(self.multi_ue.satellite_capacity_mbps)
+            or self.multi_ue.satellite_capacity_mbps <= 0.0
+        ):
+            raise ValueError("multi_ue satellite capacity must be finite and positive")
+        if (
+            not math.isfinite(self.multi_ue.minimum_admission_rate_mbps)
+            or self.multi_ue.minimum_admission_rate_mbps < 0.0
+            or self.multi_ue.minimum_admission_rate_mbps
+            > self.multi_ue.satellite_capacity_mbps
+        ):
+            raise ValueError(
+                "multi_ue minimum admission rate must be finite and lie "
+                "within satellite capacity"
+            )
+        if self.multi_ue.max_users_per_satellite <= 0:
+            raise ValueError("multi_ue max_users_per_satellite must be positive")
 
 
 def _construct(cls: type[T], values: dict[str, Any]) -> T:

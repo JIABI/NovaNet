@@ -1,4 +1,8 @@
 {
+  "artifact_status": "legacy_incompatible",
+  "usable_for_current_manuscript": false,
+  "stale_reason": "Measured before the current schema-5 current-6D/future-5D freeze-aware implementation; parameter counts, timings, and configuration fingerprint do not describe the current model.",
+  "current_config_fingerprint": "d53396a525bf68cc",
   "scope": "neural encoder, learned adjacency, heads, and Soft-DP; ephemeris/feature construction excluded",
   "threads": 1,
   "warmup": 100,

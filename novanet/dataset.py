@@ -10,16 +10,36 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .channel import LinkBudget, MeasurementTracker
+from .channel import LinkBudget, MeasurementTracker, RealizedChannelTrace
 from .config import NovaNetConfig
 from .ephemeris import build_ephemeris, orbit_balanced_records, read_tle
 from .forecast import build_forecast_sequence
-from .geometry import UETrajectory
-from .handover import handover_failure_matrix
+from .geometry import UETrajectory, geometry_state
+from .handover import CHOOutcome, counterfactual_hof_label, evaluate_cho_attempt
 
 
 class StaleTLEError(ValueError):
     pass
+
+
+def _hof_supervision(
+    outcome: CHOOutcome,
+    target_trace,
+    config: NovaNetConfig,
+) -> tuple[float, bool]:
+    """Separate all-pair teacher labels from attempted-only HOF supervision."""
+
+    target = float(
+        not outcome.success
+        if outcome.attempted
+        else counterfactual_hof_label(
+            target_trace,
+            config.handover,
+            config.channel.outage_threshold_db,
+            event_step_s=config.handover.event_step_s,
+        )
+    )
+    return target, bool(outcome.attempted)
 
 
 def tle_epoch(line1: str) -> datetime:
@@ -83,12 +103,37 @@ def validate_tle_epoch(
 @dataclass(frozen=True)
 class GenerationOptions:
     num_samples: int
+    seed: int | None = None
     measurement_noise_std_db: float = 0.0
     staleness_steps: int = 0
     ue_speed_kmh: float = 0.0
     ue_altitude_m: float = 0.0
     ue_heading_deg: float | None = None
+    initial_freeze_steps: int = 0
     allow_stale_tle: bool = False
+
+    def __post_init__(self) -> None:
+        if self.num_samples <= 0:
+            raise ValueError("num_samples must be positive")
+        values = (
+            self.measurement_noise_std_db,
+            self.ue_speed_kmh,
+            self.ue_altitude_m,
+        )
+        if not all(np.isfinite(float(value)) for value in values):
+            raise ValueError("Generation options must be finite")
+        if self.measurement_noise_std_db < 0.0:
+            raise ValueError("measurement_noise_std_db must be nonnegative")
+        if self.staleness_steps < 0:
+            raise ValueError("staleness_steps must be nonnegative")
+        if self.ue_speed_kmh < 0.0 or self.ue_altitude_m < 0.0:
+            raise ValueError("UE speed and altitude must be nonnegative")
+        if self.ue_heading_deg is not None and not np.isfinite(
+            float(self.ue_heading_deg)
+        ):
+            raise ValueError("ue_heading_deg must be finite")
+        if self.initial_freeze_steps < 0:
+            raise ValueError("initial_freeze_steps must be nonnegative")
 
 
 class NovaNetSequenceDataset(Dataset):
@@ -102,15 +147,62 @@ class NovaNetSequenceDataset(Dataset):
         sample = self.samples[index]
         result: dict[str, torch.Tensor] = {}
         for key, value in sample.items():
-            if key == "current_idx":
+            if key in {"current_idx", "initial_freeze"}:
                 result[key] = torch.tensor(value, dtype=torch.long)
             elif key.endswith("_mask") or key == "valid_mask":
                 result[key] = torch.as_tensor(value, dtype=torch.bool)
-            elif key == "selection_target":
-                result[key] = torch.as_tensor(value, dtype=torch.long)
             else:
                 result[key] = torch.as_tensor(value, dtype=torch.float32)
         return result
+
+
+def protocol_window_start_count(config: NovaNetConfig) -> int:
+    """Number of geometry-grid starts whose complete labels fit in T_obs."""
+
+    latest_start_s = (
+        config.experiment.duration_s
+        - config.planner.horizon_steps
+        * config.experiment.decision_interval_s
+        - config.handover.execution_s
+    )
+    count = int(
+        np.floor(latest_start_s / config.experiment.geometry_subsample_s)
+    ) + 1
+    if count <= 0:
+        raise ValueError(
+            "duration_s is too short for one complete planning/label window"
+        )
+    return count
+
+
+def _realized_sinr_at_offset(
+    config: NovaNetConfig,
+    ephemeris,
+    trajectory: UETrajectory,
+    channel_trace: RealizedChannelTrace,
+    ephemeris_index: int,
+    satellite_id: int,
+    offset_s: float,
+) -> float:
+    time_s = ephemeris.time_s(ephemeris_index) + offset_s
+    ue_position, ue_velocity = trajectory.state_at(time_s)
+    sat_position, sat_velocity = ephemeris.state_at_time(
+        satellite_id,
+        time_s,
+    )
+    if not (
+        np.all(np.isfinite(sat_position))
+        and np.all(np.isfinite(sat_velocity))
+    ):
+        return -100.0
+    state = geometry_state(
+        ue_position, ue_velocity, sat_position, sat_velocity
+    )
+    if state.elevation_deg < config.experiment.minimum_elevation_deg:
+        return -100.0
+    return channel_trace.evaluate(
+        state, satellite_id, time_s
+    ).sinr_db
 
 
 def _make_one_sample(
@@ -121,8 +213,14 @@ def _make_one_sample(
     rng: np.random.Generator,
     measurement_noise_std_db: float,
     staleness_steps: int,
+    initial_freeze_steps: int,
 ) -> dict[str, np.ndarray | int]:
     budget = LinkBudget(config.channel, seed=int(rng.integers(0, 2**31 - 1)))
+    channel_trace = RealizedChannelTrace(
+        config.channel,
+        seed=int(rng.integers(0, 2**31 - 1)),
+        event_step_s=config.handover.event_step_s,
+    )
     tracker = MeasurementTracker(config.channel)
 
     preliminary = build_forecast_sequence(
@@ -134,16 +232,36 @@ def _make_one_sample(
         link_budget=budget,
     )
     current_time = ephemeris.time_s(decision_index)
-    stale_age = staleness_steps * config.experiment.decision_interval_s
+    stride = int(
+        round(config.experiment.decision_interval_s / ephemeris.step_s)
+    )
+    stale_index = max(0, decision_index - staleness_steps * stride)
+    report_time = ephemeris.time_s(stale_index)
+    report_ue_position, report_ue_velocity = trajectory.state_at(report_time)
     for local, satellite_id in enumerate(preliminary.candidate_ids):
         if satellite_id < 0 or not preliminary.valid_mask[0, local]:
             continue
-        realized = preliminary.deterministic_snr_db[0, local] + rng.normal(
-            0.0,
-            max(config.channel.shadowing_std_db, 0.1),
+        sat_position = ephemeris.position_m[stale_index, satellite_id]
+        sat_velocity = ephemeris.velocity_m_s[stale_index, satellite_id]
+        if not (
+            np.all(np.isfinite(sat_position))
+            and np.all(np.isfinite(sat_velocity))
+        ):
+            continue
+        report_geometry = geometry_state(
+            report_ue_position, report_ue_velocity, sat_position, sat_velocity
         )
-        measured = realized + rng.normal(0.0, measurement_noise_std_db)
-        tracker.update(int(satellite_id), float(measured), current_time - stale_age)
+        if report_geometry.elevation_deg < config.experiment.minimum_elevation_deg:
+            continue
+        realized = channel_trace.evaluate(
+            report_geometry,
+            int(satellite_id),
+            report_time,
+        ).sinr_db
+        measured = realized + channel_trace.measurement_noise_db(
+            int(satellite_id), report_time, measurement_noise_std_db
+        )
+        tracker.update(int(satellite_id), float(measured), report_time)
 
     sequence = build_forecast_sequence(
         config,
@@ -153,68 +271,109 @@ def _make_one_sample(
         tracker,
         incumbent_id=int(preliminary.candidate_ids[preliminary.current_idx]),
         link_budget=budget,
+        initial_freeze=initial_freeze_steps,
     )
-    if np.any(~sequence.valid_mask.any(axis=1)):
-        raise RuntimeError(
-            "Training window contains a no-coverage horizon; there is no "
-            "feasible handover label for that horizon"
-        )
     horizon, candidates = sequence.valid_mask.shape
-    realized_snr = (
-        sequence.deterministic_snr_db
-        + rng.normal(
-            0.0,
-            max(config.channel.shadowing_std_db, 0.1),
-            size=(horizon, candidates),
-        )
-    ).astype(np.float32)
-    realized_snr[~sequence.valid_mask] = -100.0
+    realized_snr = np.full((horizon, candidates), -100.0, np.float32)
+    for h in range(horizon):
+        event_index = decision_index + h * stride
+        for local, satellite_id in enumerate(sequence.candidate_ids):
+            if satellite_id < 0 or not sequence.valid_mask[h, local]:
+                continue
+            realized_snr[h, local] = _realized_sinr_at_offset(
+                config,
+                ephemeris,
+                trajectory,
+                channel_trace,
+                event_index,
+                int(satellite_id),
+                0.0,
+            )
 
     hof_target = np.zeros((horizon, candidates, candidates), np.float32)
     hof_mask = np.zeros_like(hof_target, dtype=bool)
-    decision_s = config.experiment.decision_interval_s
     for h in range(horizon):
-        if h + 1 < horizon:
-            slope = (realized_snr[h + 1] - realized_snr[h]) / decision_s
-        elif h > 0:
-            slope = (realized_snr[h] - realized_snr[h - 1]) / decision_s
-        else:
-            slope = np.zeros(candidates, dtype=float)
-        labels, pair_mask = handover_failure_matrix(
-            realized_snr[h],
-            slope,
-            config.handover,
-            config.channel.outage_threshold_db,
-        )
-        valid_pair = (
-            sequence.valid_mask[h, :, None]
-            & sequence.valid_mask[h, None, :]
-        )
-        hof_target[h] = labels
-        hof_mask[h] = pair_mask & valid_pair
+        event_index = decision_index + h * stride
+        event_cache: dict[tuple[int, int], float] = {}
 
-    rate = (
-        config.channel.implementation_efficiency
-        * config.channel.bandwidth_hz
-        * np.log2(1.0 + 10.0 ** (realized_snr / 10.0))
-        / 1e6
-    )
-    oracle_score = rate + 0.05 * sequence.ttl_s
-    oracle_score[~sequence.valid_mask] = -np.inf
-    selection_target = np.argmax(oracle_score, axis=-1).astype(np.int64)
+        def event_sinr(satellite_id: int, offset_s: float) -> float:
+            event_bin = int(
+                round(offset_s / config.handover.event_step_s)
+            )
+            key = (satellite_id, event_bin)
+            if key not in event_cache:
+                event_cache[key] = _realized_sinr_at_offset(
+                    config,
+                    ephemeris,
+                    trajectory,
+                    channel_trace,
+                    event_index,
+                    satellite_id,
+                    event_bin * config.handover.event_step_s,
+                )
+            return event_cache[key]
+
+        for source in range(candidates):
+            source_id = int(sequence.candidate_ids[source])
+            if source_id < 0:
+                continue
+            for target in range(candidates):
+                target_id = int(sequence.candidate_ids[target])
+                if (
+                    source == target
+                    or target_id < 0
+                    or not sequence.valid_mask[h, target]
+                ):
+                    continue
+                source_trace = (
+                    lambda offset, sat=source_id: event_sinr(sat, offset)
+                )
+                target_trace = (
+                    lambda offset, sat=target_id: event_sinr(sat, offset)
+                )
+                outcome = evaluate_cho_attempt(
+                    source_trace,
+                    target_trace,
+                    config.handover,
+                    config.channel.outage_threshold_db,
+                    event_step_s=config.handover.event_step_s,
+                    monitoring_horizon_s=(
+                        config.experiment.decision_interval_s
+                    ),
+                )
+                # Eq. (51) trains the HOF head only from a valid attempted
+                # execution.  The all-pair realized/counterfactual target is
+                # still retained for the clairvoyant sequence teacher.
+                (
+                    hof_target[h, source, target],
+                    hof_mask[h, source, target],
+                ) = _hof_supervision(
+                    outcome,
+                    target_trace,
+                    config,
+                )
+
+    # Eq. (50): the target is the natural-log multiplicative residual in
+    # linear SINR. In dB this is ln(10)/10 times the realized-minus-nominal
+    # difference. Invalid entries are masked from the NLL.
+    residual_target = (
+        np.log(10.0)
+        / 10.0
+        * (realized_snr - sequence.deterministic_snr_db)
+    ).astype(np.float32)
+    residual_target[~sequence.valid_mask] = 0.0
     return {
         "node_features": sequence.node_features,
         "spatial_adjacency": sequence.spatial_adjacency,
         "valid_mask": sequence.valid_mask,
         "current_idx": sequence.current_idx,
-        "angular_speed_deg_s": sequence.angular_speed_deg_s,
-        "snr_target_db": realized_snr,
-        "snr_mask": sequence.valid_mask.copy(),
-        "ttl_target_s": sequence.ttl_s,
-        "ttl_mask": sequence.valid_mask.copy(),
+        "initial_freeze": sequence.initial_freeze,
+        "ttl_s": sequence.ttl_s,
+        "nominal_snr_db": sequence.deterministic_snr_db,
+        "residual_target": residual_target,
+        "residual_mask": sequence.valid_mask.copy(),
         "hof_target": hof_target,
         "hof_mask": hof_mask,
-        "selection_target": selection_target,
     }
 
 
@@ -222,6 +381,10 @@ def generate_sequence_samples(
     config: NovaNetConfig,
     options: GenerationOptions,
 ) -> list[dict[str, np.ndarray | int]]:
+    if not 0 <= options.initial_freeze_steps <= config.handover.freeze_steps:
+        raise ValueError(
+            "initial_freeze_steps must be between zero and configured freeze_steps"
+        )
     if not options.allow_stale_tle:
         validate_tle_epoch(config)
     padding_s = (
@@ -236,18 +399,20 @@ def generate_sequence_samples(
         limit_satellites=config.experiment.num_satellites,
         selection=config.experiment.tle_selection,
     )
-    rng = np.random.default_rng(config.experiment.seed)
+    rng = np.random.default_rng(
+        config.experiment.seed if options.seed is None else options.seed
+    )
     stride = int(
         round(
             config.experiment.decision_interval_s
             / config.experiment.geometry_subsample_s
         )
     )
-    final_start = (
-        ephemeris.num_steps
-        - stride * config.planner.horizon_steps
-        - 1
-    )
+    # Training labels may monitor the configured target throughout the last
+    # horizon epoch and then replay its execution window.  Select window
+    # starts from the documented observation interval only; the padded
+    # ephemeris exists for interpolation safety and is not additional data.
+    final_start = protocol_window_start_count(config)
     samples: list[dict[str, np.ndarray | int]] = []
     attempts = 0
     max_attempts = max(100, options.num_samples * 30)
@@ -277,6 +442,7 @@ def generate_sequence_samples(
                 rng,
                 options.measurement_noise_std_db,
                 options.staleness_steps,
+                options.initial_freeze_steps,
             )
         except (RuntimeError, ValueError):
             continue

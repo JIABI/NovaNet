@@ -17,6 +17,7 @@ class CHOOutcome:
     failure_reason: str | None
     completion_time_s: float | None
     interruption_s: float
+    execution_start_time_s: float | None = None
 
 
 def evaluate_cho_attempt(
@@ -25,43 +26,75 @@ def evaluate_cho_attempt(
     handover: HandoverConfig,
     outage_threshold_db: float,
     event_step_s: float = 0.01,
+    monitoring_horizon_s: float | None = None,
 ) -> CHOOutcome:
-    """Apply TTT, hysteresis, and execution checks at event-level resolution."""
+    """Apply the stored-target CHO rule over one decision interval.
 
-    trigger_times = np.arange(
-        0.0, handover.ttt_s + 0.5 * event_step_s, event_step_s
+    The timer may start at the first event-grid instant within the monitoring
+    horizon for which the target conditions become true.  A violation resets
+    it.  Once one full TTT interval has elapsed, execution proceeds even when
+    its completion extends beyond the next decision epoch.
+    """
+
+    if event_step_s <= 0.0:
+        raise ValueError("event_step_s must be positive")
+    explicit_decision_boundary = monitoring_horizon_s is not None
+    monitoring_horizon = (
+        handover.ttt_s
+        if not explicit_decision_boundary
+        else float(monitoring_horizon_s)
     )
-    condition = [
-        target_snr_db(float(time))
-        - source_snr_db(float(time))
-        >= handover.hysteresis_db
-        and target_snr_db(float(time)) >= outage_threshold_db
-        for time in trigger_times
-    ]
-    if not all(condition):
-        return CHOOutcome(False, False, "ttt_or_hysteresis_not_sustained", None, 0.0)
-
-    execution_start = handover.ttt_s
-    execution_end = handover.ttt_s + handover.execution_s
-    execution_times = np.arange(
-        execution_start,
-        execution_end + 0.5 * event_step_s,
+    if monitoring_horizon < handover.ttt_s:
+        raise ValueError("monitoring_horizon_s must be at least the TTT")
+    # An explicit monitoring horizon is the next decision boundary.  The
+    # manuscript retains a target only when execution starts *before* that
+    # boundary, so the endpoint itself is excluded.  The legacy short form
+    # without a boundary still includes the TTT endpoint.
+    trigger_times = np.arange(
+        0.0,
+        (
+            monitoring_horizon
+            if explicit_decision_boundary
+            else monitoring_horizon + 0.5 * event_step_s
+        ),
         event_step_s,
     )
-    target_outage = np.asarray(
-        [
-            target_snr_db(float(time)) < outage_threshold_db
-            for time in execution_times
-        ],
-        dtype=float,
+    required_samples = int(round(handover.ttt_s / event_step_s)) + 1
+    consecutive = 0
+    execution_start: float | None = None
+    for time in trigger_times:
+        instant = float(time)
+        target_snr = float(target_snr_db(instant))
+        source_snr = float(source_snr_db(instant))
+        if not np.isfinite(target_snr) or not np.isfinite(source_snr):
+            raise ValueError("CHO monitoring received a non-finite SNR")
+        condition = (
+            target_snr - source_snr >= handover.hysteresis_db
+            and target_snr >= outage_threshold_db
+        )
+        consecutive = consecutive + 1 if condition else 0
+        if consecutive >= required_samples:
+            execution_start = instant
+            break
+    if execution_start is None:
+        return CHOOutcome(False, False, "ttt_or_hysteresis_not_sustained", None, 0.0)
+
+    execution_end = execution_start + handover.execution_s
+    failed = counterfactual_hof_label(
+        target_snr_db,
+        handover,
+        outage_threshold_db,
+        event_step_s=event_step_s,
+        execution_start_s=execution_start,
     )
-    if target_outage.mean() > handover.failure_outage_fraction:
+    if failed:
         return CHOOutcome(
             True,
             False,
             "target_outage_during_execution",
             execution_end,
             handover.execution_s,
+            execution_start,
         )
     return CHOOutcome(
         True,
@@ -69,7 +102,38 @@ def evaluate_cho_attempt(
         None,
         execution_end,
         handover.execution_s,
+        execution_start,
     )
+
+
+def counterfactual_hof_label(
+    target_snr_db: Callable[[float], float],
+    handover: HandoverConfig,
+    outage_threshold_db: float,
+    event_step_s: float = 0.01,
+    execution_start_s: float | None = None,
+) -> bool:
+    """Replay the execution window even when the CHO trigger was not met."""
+
+    execution_start = (
+        handover.ttt_s
+        if execution_start_s is None
+        else float(execution_start_s)
+    )
+    execution_samples = int(round(handover.execution_s / event_step_s))
+    execution_times = execution_start + event_step_s * np.arange(
+        1,
+        execution_samples + 1,
+        dtype=float,
+    )
+    target_values = np.asarray(
+        [float(target_snr_db(float(time))) for time in execution_times],
+        dtype=float,
+    )
+    if not np.isfinite(target_values).all():
+        raise ValueError("CHO execution replay received a non-finite SNR")
+    target_outage = (target_values < outage_threshold_db).astype(float)
+    return bool(target_outage.mean() > handover.failure_outage_fraction)
 
 
 def handover_failure_matrix(
@@ -92,6 +156,8 @@ def handover_failure_matrix(
     slope = np.asarray(snr_slope_db_s, dtype=float)
     if current.shape != slope.shape or current.ndim != 1:
         raise ValueError("snr_now_db and snr_slope_db_s must be matching vectors")
+    if not np.isfinite(current).all() or not np.isfinite(slope).all():
+        raise ValueError("SNR values and slopes must be finite")
     candidates = len(current)
     labels = np.zeros((candidates, candidates), dtype=np.float32)
     mask = np.ones_like(labels, dtype=bool)
@@ -101,10 +167,11 @@ def handover_failure_matrix(
         handover.ttt_s + 0.5 * event_step_s,
         event_step_s,
     )
-    execution_times = np.arange(
-        handover.ttt_s,
-        handover.ttt_s + handover.execution_s + 0.5 * event_step_s,
-        event_step_s,
+    execution_samples = int(round(handover.execution_s / event_step_s))
+    execution_times = handover.ttt_s + event_step_s * np.arange(
+        1,
+        execution_samples + 1,
+        dtype=float,
     )
     for source_index in range(candidates):
         for target_index in range(candidates):
@@ -142,12 +209,10 @@ def handover_failure_matrix(
 def dimensionless_transition_cost(
     switched: np.ndarray,
     retained_dwell_normalized: np.ndarray,
-    angular_speed_normalized: np.ndarray,
     hof_probability: np.ndarray,
     *,
     base_weight: float,
     dwell_weight: float,
-    angular_speed_weight: float,
     hof_weight: float,
 ) -> np.ndarray:
     """Reference NumPy implementation used by the simulator and tests."""
@@ -156,6 +221,5 @@ def dimensionless_transition_cost(
     return indicator * (
         base_weight
         + dwell_weight * retained_dwell_normalized
-        + angular_speed_weight * angular_speed_normalized
         + hof_weight * hof_probability
     )

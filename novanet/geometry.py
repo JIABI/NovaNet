@@ -10,6 +10,7 @@ import numpy as np
 WGS84_A_M = 6_378_137.0
 WGS84_F = 1.0 / 298.257223563
 WGS84_E2 = WGS84_F * (2.0 - WGS84_F)
+WGS84_B_M = WGS84_A_M * (1.0 - WGS84_F)
 MEAN_EARTH_RADIUS_M = 6_371_008.8
 
 
@@ -35,6 +36,42 @@ def geodetic_to_ecef(
                 + altitude_m
             )
             * sin_latitude,
+        ],
+        dtype=np.float64,
+    )
+
+
+def ecef_local_zenith(position_m: np.ndarray) -> np.ndarray:
+    """Return the WGS-84 geodetic surface normal at an ECEF position."""
+
+    x, y, z = np.asarray(position_m, dtype=float)
+    horizontal = float(np.hypot(x, y))
+    if not np.isfinite(horizontal + abs(z)) or horizontal + abs(z) <= 0.0:
+        raise ValueError("Invalid ECEF position for local zenith")
+    longitude = float(np.arctan2(y, x))
+    second_eccentricity_sq = (
+        (WGS84_A_M**2 - WGS84_B_M**2) / WGS84_B_M**2
+    )
+    theta = float(
+        np.arctan2(z * WGS84_A_M, horizontal * WGS84_B_M)
+    )
+    latitude = float(
+        np.arctan2(
+            z
+            + second_eccentricity_sq
+            * WGS84_B_M
+            * np.sin(theta) ** 3,
+            horizontal
+            - WGS84_E2
+            * WGS84_A_M
+            * np.cos(theta) ** 3,
+        )
+    )
+    return np.asarray(
+        [
+            np.cos(latitude) * np.cos(longitude),
+            np.cos(latitude) * np.sin(longitude),
+            np.sin(latitude),
         ],
         dtype=np.float64,
     )
@@ -104,7 +141,7 @@ def geometry_state(
     if not np.isfinite(distance) or distance <= 0.0:
         raise ValueError("Invalid UE-satellite range")
     los_unit = los / distance
-    up = ue_position_m / np.linalg.norm(ue_position_m)
+    up = ecef_local_zenith(ue_position_m)
     sine_elevation = float(np.clip(np.dot(los_unit, up), -1.0, 1.0))
     elevation_rad = np.arcsin(sine_elevation)
 
@@ -113,12 +150,17 @@ def geometry_state(
     transverse_velocity = relative_velocity - radial_velocity * los_unit
     angular_speed_rad_s = float(np.linalg.norm(transverse_velocity) / distance)
 
-    up_rate = (
-        ue_velocity_m_s / np.linalg.norm(ue_position_m)
-        - up
-        * np.dot(up, ue_velocity_m_s)
-        / np.linalg.norm(ue_position_m)
-    )
+    if np.linalg.norm(ue_velocity_m_s) <= 0.0:
+        up_rate = np.zeros(3, dtype=float)
+    else:
+        derivative_step_s = 0.05
+        up_before = ecef_local_zenith(
+            ue_position_m - derivative_step_s * ue_velocity_m_s
+        )
+        up_after = ecef_local_zenith(
+            ue_position_m + derivative_step_s * ue_velocity_m_s
+        )
+        up_rate = (up_after - up_before) / (2.0 * derivative_step_s)
     los_rate = transverse_velocity / distance
     sine_rate = float(np.dot(los_rate, up) + np.dot(los_unit, up_rate))
     cosine_elevation = max(float(np.cos(elevation_rad)), 1e-8)
@@ -185,8 +227,8 @@ def sky_dome_adjacency(
         order = [
             int(index)
             for index in np.argsort(angular)
-            if valid[index]
-        ][: max(1, min(neighbors + 1, len(valid_indices)))]
+            if valid[index] and int(index) != int(source)
+        ][: min(neighbors, max(len(valid_indices) - 1, 0))]
         for target in order:
             adjacency[source, target] = np.exp(
                 -float(angular[target]) / max(temperature, 1e-6)
@@ -195,4 +237,3 @@ def sky_dome_adjacency(
         if total > 0.0:
             adjacency[source] /= total
     return adjacency
-

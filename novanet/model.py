@@ -22,66 +22,9 @@ VALID_ABLATIONS = frozenset(
         "Planner",
         "UncLCB",
         "TransTTL",
-        "TransVel",
         "TransHOF",
     }
 )
-
-
-def _inverse_softplus(value: float) -> float:
-    value = max(float(value), 1e-6)
-    return math.log(math.expm1(value))
-
-
-class FrozenEnergyNormalizer(nn.Module):
-    """Training-split statistics stored in, and restored from, checkpoints."""
-
-    def __init__(self):
-        super().__init__()
-        self.register_buffer("rate_mean", torch.tensor(50.0))
-        self.register_buffer("rate_std", torch.tensor(20.0))
-        self.register_buffer("ttl_mean", torch.tensor(180.0))
-        self.register_buffer("ttl_std", torch.tensor(120.0))
-        self.register_buffer("angular_speed_mean", torch.tensor(0.05))
-        self.register_buffer("angular_speed_std", torch.tensor(0.05))
-        self.register_buffer("is_fitted", torch.tensor(False))
-
-    @torch.no_grad()
-    def fit(
-        self,
-        rate_mbps: torch.Tensor,
-        ttl_s: torch.Tensor,
-        angular_speed_deg_s: torch.Tensor,
-        valid_mask: torch.Tensor | None = None,
-    ) -> None:
-        if valid_mask is None:
-            valid_mask = torch.ones_like(rate_mbps, dtype=torch.bool)
-        valid_mask = valid_mask.bool()
-        if valid_mask.sum() < 2:
-            raise ValueError("At least two valid observations are needed to fit stats")
-
-        def assign(name: str, values: torch.Tensor) -> None:
-            selected = values[valid_mask].detach().float()
-            mean = selected.mean()
-            std = selected.std(unbiased=False).clamp_min(1e-4)
-            getattr(self, f"{name}_mean").copy_(mean)
-            getattr(self, f"{name}_std").copy_(std)
-
-        assign("rate", rate_mbps)
-        assign("ttl", ttl_s)
-        assign("angular_speed", angular_speed_deg_s.abs())
-        self.is_fitted.fill_(True)
-
-    def z_rate(self, value: torch.Tensor) -> torch.Tensor:
-        return (value - self.rate_mean) / self.rate_std.clamp_min(1e-4)
-
-    def z_ttl(self, value: torch.Tensor) -> torch.Tensor:
-        return (value - self.ttl_mean) / self.ttl_std.clamp_min(1e-4)
-
-    def z_angular_speed(self, value: torch.Tensor) -> torch.Tensor:
-        return (
-            value.abs() - self.angular_speed_mean
-        ) / self.angular_speed_std.clamp_min(1e-4)
 
 
 class ResidualGraphLayer(nn.Module):
@@ -97,7 +40,7 @@ class ResidualGraphLayer(nn.Module):
 
 
 class EnergyHead(nn.Module):
-    """Dimensionless state and transition costs with explicit switch gating."""
+    """Fixed-reference implementation of manuscript Eqs. (15)--(17)."""
 
     def __init__(
         self,
@@ -110,45 +53,32 @@ class EnergyHead(nn.Module):
         self.bandwidth_hz = float(cfg.channel.bandwidth_hz)
         self.efficiency = float(cfg.channel.implementation_efficiency)
         self.lcb_kappa = float(planner.lcb_kappa)
-        self.normalizer = FrozenEnergyNormalizer()
-
-        self.raw_rate = nn.Parameter(
-            torch.tensor(_inverse_softplus(planner.rate_weight))
-        )
-        self.raw_dwell = nn.Parameter(
-            torch.tensor(_inverse_softplus(planner.dwell_weight))
-        )
-        self.raw_base = nn.Parameter(
-            torch.tensor(_inverse_softplus(planner.base_switch_cost))
-        )
-        self.raw_retained_dwell = nn.Parameter(
-            torch.tensor(_inverse_softplus(planner.retained_dwell_weight))
-        )
-        self.raw_velocity = nn.Parameter(
-            torch.tensor(_inverse_softplus(planner.angular_speed_weight))
-        )
-        self.raw_hof = nn.Parameter(
-            torch.tensor(_inverse_softplus(planner.hof_weight))
-        )
-        # The multi-UE extension is evaluated zero-shot, so its common load
-        # coefficient is a frozen validation-selected control knob rather than
-        # a parameter silently trained on all-zero single-UE loads.
-        self.raw_load = nn.Parameter(
-            torch.tensor(_inverse_softplus(planner.load_weight)),
-            requires_grad=False,
-        )
-
-    @staticmethod
-    def positive(raw: torch.Tensor) -> torch.Tensor:
-        return F.softplus(raw)
+        self.rate_reference_mbps = float(planner.rate_reference_mbps)
+        self.ttl_reference_s = float(planner.ttl_reference_s)
+        self.alpha = float(planner.alpha)
+        self.beta = float(planner.beta)
+        self.c0 = float(planner.c0)
+        self.c1 = float(planner.c1)
+        self.c2 = float(planner.c2)
+        self.load_weight = float(planner.load_weight)
 
     def lcb_rate_mbps(
-        self, snr_mu_db: torch.Tensor, snr_logvar_db2: torch.Tensor
+        self,
+        nominal_snr_db: torch.Tensor,
+        residual_mu: torch.Tensor,
+        residual_sigma: torch.Tensor,
     ) -> torch.Tensor:
-        sigma_db = torch.exp(0.5 * snr_logvar_db2.clamp(-12.0, 12.0))
+        """Map the log-SINR residual LCB of Eqs. (37)--(40) to Mbps."""
+
         kappa = 0.0 if "UncLCB" in self.ablations else self.lcb_kappa
-        lcb_db = snr_mu_db - kappa * sigma_db
-        snr_linear = torch.pow(10.0, lcb_db / 10.0)
+        residual_lcb = residual_mu - kappa * residual_sigma
+        lcb_db = nominal_snr_db + (10.0 / math.log(10.0)) * residual_lcb
+        return self.rate_from_snr_db(lcb_db)
+
+    def rate_from_snr_db(self, snr_db: torch.Tensor) -> torch.Tensor:
+        """Evaluate the configured physical-rate mapping for an SNR in dB."""
+
+        snr_linear = torch.pow(10.0, snr_db / 10.0)
         return (
             self.efficiency
             * self.bandwidth_hz
@@ -158,32 +88,39 @@ class EnergyHead(nn.Module):
 
     def state_cost(
         self,
-        snr_mu_db: torch.Tensor,
-        snr_logvar_db2: torch.Tensor,
+        nominal_snr_db: torch.Tensor,
+        residual_mu: torch.Tensor,
+        residual_sigma: torch.Tensor,
         ttl_s: torch.Tensor,
+        current_snr_db: torch.Tensor,
         load: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        rate_mbps = self.lcb_rate_mbps(snr_mu_db, snr_logvar_db2)
-        z_rate = self.normalizer.z_rate(rate_mbps)
-        z_ttl = self.normalizer.z_ttl(ttl_s)
+        rate_mbps = self.lcb_rate_mbps(
+            nominal_snr_db, residual_mu, residual_sigma
+        )
+        # Manuscript Eq. (44): h=0 consumes the current measured link quality;
+        # residual forecasting and its LCB are used only for h >= 1.
+        rate_mbps = rate_mbps.clone()
+        rate_mbps[:, 0, :] = self.rate_from_snr_db(current_snr_db)
+        normalized_rate = rate_mbps / self.rate_reference_mbps
+        normalized_ttl = ttl_s / self.ttl_reference_s
         if load is None:
             load = torch.zeros_like(rate_mbps)
         cost = (
-            -self.positive(self.raw_rate) * z_rate
-            - self.positive(self.raw_dwell) * z_ttl
-            + self.positive(self.raw_load) * load
+            -self.alpha * normalized_rate
+            - self.beta * normalized_ttl
+            + self.load_weight * load
         )
         return cost, {
             "lcb_rate_mbps": rate_mbps,
-            "z_rate": z_rate,
-            "z_ttl": z_ttl,
+            "normalized_rate": normalized_rate,
+            "normalized_ttl": normalized_ttl,
             "load": load,
         }
 
     def transition_cost(
         self,
         ttl_s: torch.Tensor,
-        angular_speed_deg_s: torch.Tensor,
         hof_probability: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return [B,H,K,K] cost; every diagonal stay transition is exactly 0."""
@@ -194,14 +131,7 @@ class EnergyHead(nn.Module):
         ttl_source = ttl_s[:, :, :, None].expand(
             batch, horizon, candidates, candidates
         )
-        omega_source = angular_speed_deg_s[:, :, :, None]
-        omega_target = angular_speed_deg_s[:, :, None, :]
-        relative_omega = (omega_target - omega_source).abs()
-
-        retained_dwell = torch.sigmoid(self.normalizer.z_ttl(ttl_source))
-        angular_term = torch.sigmoid(
-            self.normalizer.z_angular_speed(relative_omega)
-        )
+        normalized_source_ttl = ttl_source / self.ttl_reference_s
         switch = (
             1.0
             - torch.eye(
@@ -210,33 +140,17 @@ class EnergyHead(nn.Module):
                 device=ttl_s.device,
             )[None, None, :, :]
         )
-        base = self.positive(self.raw_base)
-        retained_weight = (
-            torch.zeros_like(self.raw_retained_dwell)
-            if "TransTTL" in self.ablations
-            else self.positive(self.raw_retained_dwell)
-        )
-        velocity_weight = (
-            torch.zeros_like(self.raw_velocity)
-            if "TransVel" in self.ablations
-            else self.positive(self.raw_velocity)
-        )
-        hof_weight = (
-            torch.zeros_like(self.raw_hof)
-            if "TransHOF" in self.ablations
-            else self.positive(self.raw_hof)
-        )
+        retained_weight = 0.0 if "TransTTL" in self.ablations else self.c1
+        hof_weight = 0.0 if "TransHOF" in self.ablations else self.c2
         cost = switch * (
-            base
-            + retained_weight * retained_dwell
-            + velocity_weight * angular_term
+            self.c0
+            + retained_weight * normalized_source_ttl
             + hof_weight * hof_probability
         )
         return cost, {
             "switch_indicator": switch,
-            "base": switch * base,
-            "retained_dwell": switch * retained_dwell,
-            "angular_speed": switch * angular_term,
+            "base": switch * self.c0,
+            "normalized_source_ttl": switch * normalized_source_ttl,
             "hof_probability": switch * hof_probability,
         }
 
@@ -282,10 +196,8 @@ class NovaNet(nn.Module):
                 layers.append(nn.Softplus())
             return nn.Sequential(*layers)
 
-        self.snr_mean_head = scalar_head()
-        self.snr_logvar_head = scalar_head()
-        self.ttl_head = scalar_head(positive=True)
-        self.selection_head = scalar_head()
+        self.residual_mean_head = scalar_head()
+        self.residual_logvar_head = scalar_head()
 
         pair_dim = 3 * hidden + model_cfg.transition_feature_dim
         self.hof_head = nn.Sequential(
@@ -299,6 +211,7 @@ class NovaNet(nn.Module):
         self.planner = SoftDP(
             horizon=planner_cfg.horizon_steps,
             temperature=planner_cfg.temperature,
+            freeze_steps=self.config.handover.freeze_steps,
         )
 
     @property
@@ -313,21 +226,24 @@ class NovaNet(nn.Module):
         initial_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, horizon, candidates, _ = node_features.shape
-        hidden = self.node_encoder(node_features)
-        valid_float = valid_mask[..., None].to(hidden.dtype)
-        hidden = hidden * valid_float
+        # The current graph consumes the complete six-dimensional measured
+        # feature vector.  Future states are not separate observed graphs:
+        # they contain only the five SGP4/TTL features and are rolled through
+        # the same identity-aligned GRU, as specified in Sec. III-B.
+        current = self.node_encoder(node_features[:, 0])
+        current = current * valid_mask[:, 0, :, None].to(current.dtype)
 
-        prior = spatial_adjacency.clamp_min(0.0)
+        prior = spatial_adjacency[:, 0].clamp_min(0.0)
         pair_valid = (
-            valid_mask[:, :, :, None]
-            & valid_mask[:, :, None, :]
+            valid_mask[:, 0, :, None]
+            & valid_mask[:, 0, None, :]
             & (prior > 0.0)
         )
         if "DynAdj" in self.ablations:
             adjacency = prior
         else:
-            query = self.adjacency_query(hidden)
-            key = self.adjacency_key(hidden)
+            query = self.adjacency_query(current)
+            key = self.adjacency_key(current)
             logits = torch.matmul(query, key.transpose(-1, -2))
             logits = logits / math.sqrt(query.shape[-1])
             logits = logits + torch.log(prior.clamp_min(1e-8))
@@ -339,11 +255,19 @@ class NovaNet(nn.Module):
         adjacency = adjacency * pair_valid.to(adjacency.dtype)
         adjacency = adjacency / adjacency.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
-        flat_hidden = hidden.reshape(batch * horizon, candidates, -1)
-        flat_adj = adjacency.reshape(batch * horizon, candidates, candidates)
+        spatial = current
         for layer in self.graph_layers:
-            flat_hidden = layer(flat_hidden, flat_adj)
-        spatial = flat_hidden.reshape(batch, horizon, candidates, -1)
+            spatial = layer(spatial, adjacency)
+
+        first_linear = self.node_encoder[0]
+        future = F.linear(
+            node_features[:, 1:, :, :5],
+            first_linear.weight[:, :5],
+            first_linear.bias,
+        )
+        future = self.node_encoder[1](future)
+        future = self.node_encoder[2](future)
+        future = future * valid_mask[:, 1:, :, None].to(future.dtype)
 
         if initial_hidden is None:
             recurrent = torch.zeros(
@@ -364,21 +288,29 @@ class NovaNet(nn.Module):
         recurrent = recurrent.reshape(batch * candidates, -1)
         outputs = []
         for t in range(horizon):
-            current = spatial[:, t].reshape(batch * candidates, -1)
+            encoded_t = (
+                spatial if t == 0 else future[:, t - 1]
+            ).reshape(batch * candidates, -1)
             if "Temporal" in self.ablations:
-                recurrent = current
+                updated = encoded_t
             else:
-                recurrent = self.temporal_gru(current, recurrent)
+                updated = self.temporal_gru(encoded_t, recurrent)
             mask_t = valid_mask[:, t].reshape(batch * candidates, 1)
-            recurrent = torch.where(mask_t, recurrent, torch.zeros_like(recurrent))
-            outputs.append(recurrent.reshape(batch, candidates, -1))
+            # An invisible incumbent keeps its last identity-cached state for
+            # forced-recovery pair scoring at this step.  It is not carried as
+            # the GRU predecessor for a future reappearance, which preserves
+            # the zero-birth rule of the horizon rollout.
+            visible_output = torch.where(mask_t, updated, recurrent)
+            outputs.append(visible_output.reshape(batch, candidates, -1))
+            recurrent = torch.where(
+                mask_t, visible_output, torch.zeros_like(visible_output)
+            )
         return torch.stack(outputs, dim=1)
 
     def _transition_features(
         self,
         hidden: torch.Tensor,
-        angular_speed_deg_s: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         batch, horizon, candidates, width = hidden.shape
         source = hidden[:, :, :, None, :].expand(
             batch, horizon, candidates, candidates, width
@@ -387,17 +319,24 @@ class NovaNet(nn.Module):
             batch, horizon, candidates, candidates, width
         )
 
-        relative_omega = (
-            angular_speed_deg_s[:, :, None, :]
-            - angular_speed_deg_s[:, :, :, None]
-        ).abs()
-        ttt = torch.full_like(relative_omega, self.config.handover.ttt_s)
+        shape = (batch, horizon, candidates, candidates)
+        reference = hidden.new_zeros(shape)
+        ttt = torch.full_like(reference, self.config.handover.ttt_s)
+        execution = torch.full_like(reference, self.config.handover.execution_s)
         hysteresis = torch.full_like(
-            relative_omega, self.config.handover.hysteresis_db
+            reference, self.config.handover.hysteresis_db
         )
-        context = torch.stack((relative_omega, ttt, hysteresis), dim=-1)
+        threshold = torch.full_like(
+            reference, self.config.channel.outage_threshold_db
+        )
+        failure_fraction = torch.full_like(
+            reference, self.config.handover.failure_outage_fraction
+        )
+        context = torch.stack(
+            (ttt, execution, hysteresis, threshold, failure_fraction), dim=-1
+        )
         pair = torch.cat((source, target, (target - source).abs(), context), dim=-1)
-        return pair, relative_omega
+        return pair
 
     def forward(
         self,
@@ -405,21 +344,25 @@ class NovaNet(nn.Module):
         spatial_adjacency: torch.Tensor,
         valid_mask: torch.Tensor,
         current_idx: torch.Tensor,
-        angular_speed_deg_s: torch.Tensor,
+        ttl_s: torch.Tensor,
+        nominal_snr_db: torch.Tensor,
         load: torch.Tensor | None = None,
         initial_hidden: torch.Tensor | None = None,
+        initial_freeze: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         """Plan from an explicit future candidate/feature sequence.
 
         Args:
-            node_features: ``[B,H,K,9]`` causal feature forecasts.
+            node_features: ``[B,H,K,6]`` features from manuscript Eq. (24).
             spatial_adjacency: ``[B,H,K,K]`` sky-dome adjacency.
             valid_mask: ``[B,H,K]`` visibility/candidate mask.
             current_idx: ``[B]`` incumbent index in the aligned candidate union.
-            angular_speed_deg_s: ``[B,H,K]`` apparent angular speed.
+            ttl_s: ``[B,H,K]`` TTL propagated directly by TLE/SGP4.
+            nominal_snr_db: ``[B,H,K]`` deterministic nominal link SINR.
             load: optional normalized ``[B,H,K]`` load forecast.
             initial_hidden: optional incumbent-history state ``[B,K,d]``
                 aligned by global satellite identifier.
+            initial_freeze: optional actual CHO freeze counter ``[B]``.
         """
 
         if node_features.ndim != 4:
@@ -441,34 +384,47 @@ class NovaNet(nn.Module):
             )
         if tuple(valid_mask.shape) != (batch, horizon, candidates):
             raise ValueError("valid_mask shape does not match node_features")
-        if tuple(angular_speed_deg_s.shape) != (batch, horizon, candidates):
-            raise ValueError("angular_speed_deg_s shape does not match node_features")
+        if tuple(ttl_s.shape) != (batch, horizon, candidates):
+            raise ValueError("ttl_s shape does not match node_features")
+        if tuple(nominal_snr_db.shape) != (batch, horizon, candidates):
+            raise ValueError("nominal_snr_db shape does not match node_features")
+
+        current_snr_db = (
+            node_features[:, 0, :, 5] * self.config.model.sinr_reference_db
+        )
 
         if "OrbitPrior" in self.ablations:
             node_features = node_features.clone()
-            node_features[..., :6] = 0.0
+            node_features[..., :5] = 0.0
         hidden = self._encode(
             node_features,
             spatial_adjacency,
             valid_mask,
             initial_hidden,
         )
-        snr_mu = self.snr_mean_head(hidden).squeeze(-1)
-        snr_logvar = self.snr_logvar_head(hidden).squeeze(-1).clamp(-10.0, 8.0)
-        ttl_s = self.ttl_head(hidden).squeeze(-1)
-        selection_logits = self.selection_head(hidden).squeeze(-1)
+        residual_mu = self.residual_mean_head(hidden).squeeze(-1)
+        residual_scale_raw = self.residual_logvar_head(hidden).squeeze(-1)
+        residual_sigma = F.softplus(residual_scale_raw) + 1e-4
+        residual_logvar = 2.0 * torch.log(residual_sigma)
 
-        pair, relative_omega = self._transition_features(
-            hidden, angular_speed_deg_s
-        )
+        pair = self._transition_features(hidden)
         hof_logits = self.hof_head(pair).squeeze(-1)
         hof_probability = torch.sigmoid(hof_logits)
+        diagonal = torch.eye(
+            candidates, dtype=torch.bool, device=hof_probability.device
+        )[None, None]
+        hof_probability = hof_probability.masked_fill(diagonal, 0.0)
 
         state_cost, state_components = self.energy.state_cost(
-            snr_mu, snr_logvar, ttl_s, load
+            nominal_snr_db,
+            residual_mu,
+            residual_sigma,
+            ttl_s,
+            current_snr_db,
+            load,
         )
         transition_cost, transition_components = self.energy.transition_cost(
-            ttl_s, angular_speed_deg_s, hof_probability
+            ttl_s, hof_probability
         )
         if "Planner" in self.ablations:
             batch_index = torch.arange(batch, device=state_cost.device)
@@ -476,42 +432,61 @@ class NovaNet(nn.Module):
                 transition_cost[batch_index, 0, current_idx, :]
                 + state_cost[:, 0, :]
             )
-            first_logits = (-first_cost / self.config.planner.temperature).masked_fill(
-                ~valid_mask[:, 0, :],
-                -torch.finfo(first_cost.dtype).max / 1e4,
-            )
+            first_allowed = valid_mask[:, 0, :].clone()
+            if initial_freeze is not None:
+                freeze = initial_freeze.to(
+                    device=first_cost.device, dtype=torch.long
+                )
+                locked = (freeze > 0) & valid_mask[
+                    batch_index, 0, current_idx
+                ]
+                stay = F.one_hot(
+                    current_idx, num_classes=candidates
+                ).to(dtype=torch.bool)
+                first_allowed = first_allowed & (
+                    ~locked[:, None] | stay
+                )
+            first_logits = (
+                -first_cost / self.config.planner.temperature
+            ).masked_fill(~first_allowed, -torch.inf)
             first_action = torch.softmax(first_logits, dim=-1)
             cost_to_go = state_cost
             conditional_policy = torch.zeros_like(transition_cost)
+            first_step_cost = first_cost.masked_fill(
+                ~first_allowed, torch.inf
+            )
         else:
             planner_result = self.planner(
                 state_cost,
                 transition_cost,
                 current_idx,
                 valid_mask,
+                initial_freeze=initial_freeze,
                 return_details=True,
             )
             first_action = planner_result.first_action
             cost_to_go = planner_result.cost_to_go
             conditional_policy = planner_result.conditional_policy
-        masked_selection_logits = selection_logits.masked_fill(
-            ~valid_mask, -torch.finfo(selection_logits.dtype).max / 1e4
-        )
-
+            first_step_cost = planner_result.first_cost
+            first_action = torch.softmax(
+                -first_step_cost / self.config.planner.policy_temperature,
+                dim=-1,
+            )
         return {
             "hidden": hidden,
-            "snr_mu": snr_mu,
-            "snr_logvar": snr_logvar,
+            "residual_mu": residual_mu,
+            "residual_scale_raw": residual_scale_raw,
+            "residual_sigma": residual_sigma,
+            "residual_logvar": residual_logvar,
             "ttl_s": ttl_s,
-            "selection_logits": masked_selection_logits,
             "hof_logits": hof_logits,
             "hof_probability": hof_probability,
             "state_cost": state_cost,
             "transition_cost": transition_cost,
             "q_next": first_action,
+            "first_step_cost": first_step_cost,
             "cost_to_go": cost_to_go,
             "conditional_policy": conditional_policy,
             "state_components": state_components,
             "transition_components": transition_components,
-            "relative_angular_speed": relative_omega,
         }

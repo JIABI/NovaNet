@@ -38,6 +38,19 @@ def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict:
     return {key: value.to(device) for key, value in batch.items()}
 
 
+def supervision_counts(samples: list[dict]) -> dict[str, int]:
+    """Count labels that contribute to the two masked supervised heads."""
+
+    return {
+        "residual_labels": int(
+            sum(np.count_nonzero(sample["residual_mask"]) for sample in samples)
+        ),
+        "hof_labels": int(
+            sum(np.count_nonzero(sample["hof_mask"]) for sample in samples)
+        ),
+    }
+
+
 def run_epoch(
     model: NovaNet,
     loader: DataLoader,
@@ -61,6 +74,7 @@ def run_epoch(
                 batch["current_idx"],
                 batch["ttl_s"],
                 batch["nominal_snr_db"],
+                initial_freeze=batch.get("initial_freeze"),
             )
             loss, components = compute_training_loss(outputs, batch, model)
             if not torch.isfinite(loss):
@@ -108,6 +122,8 @@ def main() -> int:
         raise ValueError("Training requires at least two samples")
     train_set = NovaNetSequenceDataset(samples[:split])
     validation_set = NovaNetSequenceDataset(samples[split:])
+    train_supervision = supervision_counts(samples[:split])
+    validation_supervision = supervision_counts(samples[split:])
     generator = torch.Generator().manual_seed(cfg.experiment.seed)
     train_loader = DataLoader(
         train_set,
@@ -138,7 +154,21 @@ def main() -> int:
     history_path = output.with_suffix(".history.csv")
     metadata_path = output.with_suffix(".metadata.json")
     epochs = args.epochs or cfg.training.epochs
+    paper_table_eligible = bool(
+        not args.allow_stale_tle
+        and sample_count == cfg.training.num_samples
+        and epochs == cfg.training.epochs
+    )
+    if paper_table_eligible and (
+        min(train_supervision.values()) <= 0
+        or min(validation_supervision.values()) <= 0
+    ):
+        raise RuntimeError(
+            "A manuscript-grade split requires nonempty residual and HOF "
+            "supervision in both training and validation partitions"
+        )
     best_validation = float("inf")
+    checkpoint_written = False
     rows: list[dict[str, float | int]] = []
     for epoch in range(1, epochs + 1):
         train_metrics = run_epoch(
@@ -174,12 +204,57 @@ def main() -> int:
                     "model_state": model.state_dict(),
                     "config": asdict(cfg),
                     "config_fingerprint": cfg.fingerprint,
+                    "checkpoint_kind": "novanet",
+                    "training_protocol": "novanet_h6_softdp_sequence_v2",
+                    # A best-so-far file is not a completed training artifact.
+                    # It is promoted only after the full epoch loop returns.
+                    "paper_table_eligible": False,
+                    "training": {
+                        "samples": sample_count,
+                        "train_samples": len(train_set),
+                        "validation_samples": len(validation_set),
+                        "epochs_requested": epochs,
+                        "epochs_completed": epoch,
+                        "training_complete": False,
+                        "batch_size": cfg.training.batch_size,
+                        "optimizer": "AdamW",
+                        "learning_rate": cfg.training.learning_rate,
+                        "weight_decay": 0.0,
+                        "training_seed": cfg.experiment.seed,
+                        "allow_stale_tle": bool(args.allow_stale_tle),
+                        "train_residual_labels": train_supervision[
+                            "residual_labels"
+                        ],
+                        "validation_residual_labels": validation_supervision[
+                            "residual_labels"
+                        ],
+                        "train_hof_labels": train_supervision["hof_labels"],
+                        "validation_hof_labels": validation_supervision[
+                            "hof_labels"
+                        ],
+                    },
                     "epoch": epoch,
                     "validation": validation_metrics,
                     "tle_provenance": tle_provenance,
                 },
                 output,
             )
+            checkpoint_written = True
+
+    if not checkpoint_written:
+        raise RuntimeError(
+            "Training completed without a finite validation checkpoint"
+        )
+    # Promote the selected best epoch only after every requested epoch has
+    # completed.  Atomic replacement prevents an interrupted final write from
+    # exposing a manuscript-qualified checkpoint.
+    payload = torch.load(output, map_location="cpu", weights_only=False)
+    payload["training"]["epochs_completed"] = epochs
+    payload["training"]["training_complete"] = True
+    payload["paper_table_eligible"] = paper_table_eligible
+    finalized_output = output.with_name(f".{output.name}.finalizing")
+    torch.save(payload, finalized_output)
+    finalized_output.replace(output)
 
     with history_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
@@ -190,9 +265,16 @@ def main() -> int:
             {
                 "config_fingerprint": cfg.fingerprint,
                 "best_validation_loss": best_validation,
+                "training_protocol": "novanet_h6_softdp_sequence_v2",
+                "paper_table_eligible": paper_table_eligible,
+                "epochs_requested": epochs,
+                "epochs_completed": epochs,
+                "training_complete": True,
                 "samples": sample_count,
                 "train_samples": len(train_set),
                 "validation_samples": len(validation_set),
+                "train_supervision": train_supervision,
+                "validation_supervision": validation_supervision,
                 "allow_stale_tle": args.allow_stale_tle,
                 "tle_provenance": tle_provenance,
             },

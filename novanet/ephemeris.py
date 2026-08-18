@@ -12,6 +12,9 @@ from sgp4.api import Satrec, jday
 
 
 EARTH_ROTATION_RAD_S = 7.2921150e-5
+MIN_LEO_RADIUS_KM = 6_350.0
+MAX_LEO_RADIUS_KM = 9_000.0
+MAX_LEO_SPEED_KM_S = 12.0
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,38 @@ class Ephemeris:
 
     def time_s(self, index: int) -> float:
         return float(index) * self.step_s
+
+    def state_at_time(
+        self,
+        satellite_id: int,
+        time_s: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Linearly interpolate a propagated state on the stored time grid."""
+
+        if not 0 <= satellite_id < self.num_satellites:
+            raise IndexError("satellite_id outside ephemeris")
+        coordinate = float(time_s) / self.step_s
+        if coordinate < 0.0 or coordinate > self.num_steps - 1:
+            nan = np.full(3, np.nan, dtype=float)
+            return nan, nan.copy()
+        left = int(np.floor(coordinate))
+        right = min(left + 1, self.num_steps - 1)
+        fraction = coordinate - left
+        left_position = self.position_m[left, satellite_id]
+        left_velocity = self.velocity_m_s[left, satellite_id]
+        right_position = self.position_m[right, satellite_id]
+        right_velocity = self.velocity_m_s[right, satellite_id]
+        if not (
+            np.all(np.isfinite(left_position))
+            and np.all(np.isfinite(left_velocity))
+            and np.all(np.isfinite(right_position))
+            and np.all(np.isfinite(right_velocity))
+        ):
+            nan = np.full(3, np.nan, dtype=float)
+            return nan, nan.copy()
+        position = (1.0 - fraction) * left_position + fraction * right_position
+        velocity = (1.0 - fraction) * left_velocity + fraction * right_velocity
+        return position, velocity
 
 
 def read_tle(path: str | Path) -> list[tuple[str, str, str]]:
@@ -195,13 +230,32 @@ def build_ephemeris(
     limit_satellites: int | None = None,
     selection: str = "shell_stratified_orbit_balanced_nested",
 ) -> Ephemeris:
-    if start_utc.tzinfo is None:
-        start_utc = start_utc.replace(tzinfo=timezone.utc)
     records = read_tle(tle_path)
     if limit_satellites is not None:
         if selection != "shell_stratified_orbit_balanced_nested":
             raise ValueError(f"Unsupported TLE selection strategy: {selection}")
         records = orbit_balanced_records(records, limit_satellites)
+    return build_ephemeris_from_records(
+        records,
+        start_utc=start_utc,
+        duration_s=duration_s,
+        step_s=step_s,
+    )
+
+
+def build_ephemeris_from_records(
+    records: list[tuple[str, str, str]],
+    *,
+    start_utc: datetime,
+    duration_s: int,
+    step_s: int,
+) -> Ephemeris:
+    """Propagate an explicitly ordered set of TLE records."""
+
+    if not records:
+        raise ValueError("At least one TLE record is required")
+    if start_utc.tzinfo is None:
+        start_utc = start_utc.replace(tzinfo=timezone.utc)
     satellites = [
         (name, Satrec.twoline2rv(line1, line2))
         for name, line1, line2 in records
@@ -225,9 +279,21 @@ def build_ephemeris(
             error, teme_position, teme_velocity = satellite.sgp4(jd, fraction)
             if error != 0:
                 continue
+            teme_position_array = np.asarray(teme_position, dtype=float)
+            teme_velocity_array = np.asarray(teme_velocity, dtype=float)
+            orbital_radius_km = float(np.linalg.norm(teme_position_array))
+            orbital_speed_km_s = float(np.linalg.norm(teme_velocity_array))
+            # SGP4 can return error=0 while an extremely stale/decayed TLE
+            # extrapolates to a nonphysical state.  Do not let those states
+            # enter visibility, feature normalization, or link-budget code.
+            if not (
+                MIN_LEO_RADIUS_KM <= orbital_radius_km <= MAX_LEO_RADIUS_KM
+                and 0.0 < orbital_speed_km_s <= MAX_LEO_SPEED_KM_S
+            ):
+                continue
             ecef_position, ecef_velocity = _teme_state_to_ecef(
-                np.asarray(teme_position, dtype=float),
-                np.asarray(teme_velocity, dtype=float),
+                teme_position_array,
+                teme_velocity_array,
                 full_jd,
             )
             position[time_index, sat_index] = ecef_position

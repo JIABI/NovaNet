@@ -22,7 +22,7 @@ import numpy as np
 from novanet.config import load_config
 from novanet.latency import latency_summary, simulate_fifo_latency
 
-from experiments.common import write_rows
+from experiments.common import artifact_sha256, write_rows, write_protocol
 
 
 def read_trace(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -65,10 +65,12 @@ def main() -> int:
     if not trace_files:
         raise FileNotFoundError(f"No method CSV traces in {directory}")
     rows = []
+    input_artifacts: list[dict] = []
     for path in trace_files:
         method = path.stem
         times, rates = read_trace(path)
-        blackouts = read_blackouts(directory / f"{method}.blackouts.csv")
+        blackout_path = directory / f"{method}.blackouts.csv"
+        blackouts = read_blackouts(blackout_path)
         trace = simulate_fifo_latency(
             cfg.traffic,
             cfg.experiment.duration_s,
@@ -104,8 +106,47 @@ def main() -> int:
             }
         )
         rows.append(summary)
+        input_artifacts.append(
+            {
+                "method": method,
+                "rate_trace": {
+                    "name": path.name,
+                    "sha256": artifact_sha256(path),
+                    "rows": int(len(times)),
+                    "sample_and_hold_through_s": float(
+                        cfg.experiment.duration_s
+                    ),
+                },
+                "blackout_trace": (
+                    {
+                        "name": blackout_path.name,
+                        "sha256": artifact_sha256(blackout_path),
+                        "intervals": int(len(blackouts)),
+                    }
+                    if blackout_path.is_file()
+                    else None
+                ),
+            }
+        )
     write_rows(args.output, rows)
-    print(f"wrote {args.output}")
+    protocol_path = Path(args.output).with_name(
+        f"{Path(args.output).stem}_protocol.json"
+    )
+    write_protocol(
+        protocol_path,
+        cfg,
+        runner="experiments.latency_from_traces",
+        details={
+            "trace_directory": directory.name,
+            "input_artifacts": input_artifacts,
+            "rate_interpolation": "left-continuous sample-and-hold",
+            "packet_service": (
+                "each accepted packet requires packet_size_bytes*8 bits "
+                "under the piecewise-constant service process"
+            ),
+        },
+    )
+    print(f"wrote {args.output} and {protocol_path}")
     return 0
 
 

@@ -31,6 +31,8 @@ EIRP_DENSITY_DBW_MHZ = CFG.channel.eirp_density_dbw_mhz
 SAT_TX_POWER_DBM = CFG.channel.total_eirp_dbm
 SAT_ANT_GAIN_DBI = 0.0  # EIRP already includes the transmit antenna pattern.
 UE_ANT_GAIN_DBI = CFG.channel.ue_antenna_gain_dbi
+UE_ANTENNA_ELEMENTS = CFG.channel.ue_antenna_elements
+EXOGENOUS_INTERFERENCE_POWER_W = CFG.channel.exogenous_interference_power_w
 NOISE_PSD_DBM_HZ = CFG.channel.noise_psd_dbm_hz
 SYSTEM_NOISE_TEMPERATURE_K = CFG.channel.system_noise_temperature_k
 PHY_EFFICIENCY = CFG.channel.implementation_efficiency
@@ -51,6 +53,7 @@ FREEZE_S = CFG.handover.freeze_steps * CFG.experiment.decision_interval_s
 W_STAT_S = CFG.handover.statistics_window_s
 CHO_MIN_SNR_DB = CFG.channel.outage_threshold_db
 HYS_MARGIN = CFG.handover.hysteresis_db
+EVENT_STEP_S = CFG.handover.event_step_s
 
 # Traffic and latency.
 PKT_SIZE_BITS = 8 * CFG.traffic.packet_size_bytes
@@ -58,6 +61,8 @@ PROC_DELAY_MS = CFG.traffic.protocol_processing_ms
 QUEUE_DELAY_MS = 0.0  # Produced by the configured FCFS queue, never hard-coded.
 
 # Model and training.
+# Deprecated compatibility constant.  The current model has no separate UE
+# vector; Eq. (24) is exactly the six-dimensional F_SAT node interface.
 F_UE = CFG.model.ue_feature_dim
 F_SAT = CFG.model.node_feature_dim
 F_EDGE = CFG.model.transition_feature_dim
@@ -67,6 +72,8 @@ GRAPH_TOPK = CFG.model.graph_neighbors
 ADJ_TAU = CFG.model.adjacency_temperature
 DP_HORIZON_STEPS = CFG.planner.horizon_steps
 DP_TEMPERATURE = CFG.planner.temperature
+POLICY_TEMPERATURE = CFG.planner.policy_temperature
+TEACHER_TEMPERATURE = CFG.planner.teacher_temperature
 DP_SWITCH_COST = CFG.planner.base_switch_cost
 DP_KAPPA = DP_SWITCH_COST
 E_KAPPA_UNCERT = CFG.planner.lcb_kappa

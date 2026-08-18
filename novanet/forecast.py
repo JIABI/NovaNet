@@ -17,16 +17,35 @@ from .geometry import (
 )
 
 
+def _finite_difference_at(
+    values: np.ndarray,
+    index: int,
+    step_s: float,
+) -> float:
+    """Finite-difference a propagated geometry trace at one SGP4 epoch."""
+
+    left = index - 1
+    right = index + 1
+    if left >= 0 and right < len(values):
+        if np.isfinite(values[left]) and np.isfinite(values[right]):
+            return float((values[right] - values[left]) / (2.0 * step_s))
+    if right < len(values) and np.isfinite(values[index]) and np.isfinite(values[right]):
+        return float((values[right] - values[index]) / step_s)
+    if left >= 0 and np.isfinite(values[left]) and np.isfinite(values[index]):
+        return float((values[index] - values[left]) / step_s)
+    return 0.0
+
+
 @dataclass(frozen=True)
 class ForecastSequence:
     node_features: np.ndarray
     spatial_adjacency: np.ndarray
     valid_mask: np.ndarray
-    angular_speed_deg_s: np.ndarray
     candidate_ids: np.ndarray
     current_idx: int
     deterministic_snr_db: np.ndarray
     ttl_s: np.ndarray
+    initial_freeze: int = 0
 
 
 def _visible_ranked(
@@ -80,13 +99,14 @@ def build_forecast_sequence(
     measurement_tracker: MeasurementTracker,
     incumbent_id: int | None = None,
     link_budget: LinkBudget | None = None,
+    initial_freeze: int = 0,
 ) -> ForecastSequence:
     """Construct the exact H-step input used at deployment.
 
-    Future geometry is known from TLE/SGP4. Future channel values are *not*
-    observed: they are causal forecasts from deterministic link-budget values
-    plus the decaying residual of the latest measurement report. Predictive
-    variance grows with report age and horizon.
+    Future geometry and TTL are known from TLE/SGP4.  The sixth node feature is
+    a decision-time measurement and is populated only at ``h=0``; future
+    realized SINR is never inserted into the graph input.  Deterministic future
+    SINR is returned separately for the residual/uncertainty head.
     """
 
     cfg = config
@@ -153,7 +173,6 @@ def build_forecast_sequence(
     features = np.zeros((horizon, candidates, cfg.model.node_feature_dim), np.float32)
     adjacency = np.zeros((horizon, candidates, candidates), np.float32)
     valid_mask = np.zeros((horizon, candidates), dtype=bool)
-    angular_speed = np.zeros((horizon, candidates), np.float32)
     deterministic_snr = np.full((horizon, candidates), -100.0, np.float32)
     ttl_s = np.zeros((horizon, candidates), np.float32)
 
@@ -163,7 +182,7 @@ def build_forecast_sequence(
             continue
         elevation_trace = np.empty(ephemeris.num_steps, dtype=float)
         elevation_trace.fill(np.nan)
-        for ephemeris_index in range(decision_index, ephemeris.num_steps):
+        for ephemeris_index in range(max(decision_index - 1, 0), ephemeris.num_steps):
             ue_position, ue_velocity = trajectory.state_at(
                 ephemeris.time_s(ephemeris_index)
             )
@@ -189,45 +208,56 @@ def build_forecast_sequence(
                 if geometries[h][satellite_id] is not None
             )
             now_geometry = geometries[first_valid_horizon][satellite_id]
-        deterministic_now = budget.evaluate(
-            now_geometry, stochastic=False
-        ).snr_db
+        deterministic_now = budget.evaluate(now_geometry, stochastic=False).sinr_db
+        measured_now, _age_s, _available = measurement_tracker.current_fields(
+            int(satellite_id), current_time_s, deterministic_now
+        )
         for h, ephemeris_index in enumerate(horizon_indices):
             state = geometries[h][satellite_id]
             if state is None:
                 continue
             visible = state.elevation_deg >= cfg.experiment.minimum_elevation_deg
             valid_mask[h, local] = visible
-            angular_speed[h, local] = state.angular_speed_deg_s
             link = budget.evaluate(state, stochastic=False)
-            deterministic_snr[h, local] = link.snr_db
+            deterministic_snr[h, local] = link.sinr_db
             ttl_s[h, local] = time_to_leave_seconds(
                 elevation_trace,
                 int(ephemeris_index),
                 ephemeris.step_s,
                 cfg.experiment.minimum_elevation_deg,
             )
-            predicted_snr, _sigma, age_s, available = measurement_tracker.forecast(
-                int(satellite_id),
-                current_time_s,
-                ephemeris.time_s(int(ephemeris_index)),
-                deterministic_now,
-                link.snr_db,
-            )
             features[h, local] = np.asarray(
                 [
-                    state.elevation_deg / 90.0,
-                    state.elevation_rate_deg_s,
-                    state.range_m / 2.0e6,
-                    state.range_rate_m_s / 1.0e4,
-                    link.fspl_db / 200.0,
-                    ttl_s[h, local] / 600.0,
-                    predicted_snr / 30.0,
-                    age_s / 120.0,
-                    available,
+                    state.elevation_deg
+                    / cfg.model.elevation_reference_deg,
+                    _finite_difference_at(
+                        elevation_trace,
+                        int(ephemeris_index),
+                        ephemeris.step_s,
+                    )
+                    / cfg.model.elevation_rate_reference_deg_s,
+                    state.range_m / cfg.model.range_reference_m,
+                    state.range_rate_m_s
+                    / cfg.model.range_rate_reference_m_s,
+                    ttl_s[h, local] / cfg.planner.ttl_reference_s,
+                    (
+                        measured_now / cfg.model.sinr_reference_db
+                        if h == 0
+                        else 0.0
+                    ),
                 ],
                 dtype=np.float32,
             )
+
+    for h in range(horizon):
+        # A planning path cannot jump across a true no-coverage epoch.  Treat
+        # the first empty horizon slot as an early terminal boundary and mask
+        # every later slot.  Soft-DP consumes this terminal suffix directly;
+        # deployment must not replace the learned planner with an unrelated
+        # heuristic merely because coverage ends inside the forecast window.
+        if not valid_mask[h].any():
+            valid_mask[h:] = False
+            break
 
     for h in range(horizon):
         los = np.zeros((candidates, 3), dtype=float)
@@ -246,9 +276,9 @@ def build_forecast_sequence(
         node_features=features,
         spatial_adjacency=adjacency,
         valid_mask=valid_mask,
-        angular_speed_deg_s=angular_speed,
         candidate_ids=candidate_ids,
         current_idx=current_idx,
         deterministic_snr_db=deterministic_snr,
         ttl_s=ttl_s,
+        initial_freeze=int(initial_freeze),
     )

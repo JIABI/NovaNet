@@ -1,4 +1,8 @@
 {
+  "artifact_status": "legacy_diagnostic_incompatible",
+  "usable_for_current_manuscript": false,
+  "stale_reason": "Generated before the current schema-5 current-6D/future-5D freeze-aware model and with a date-mismatched TLE; it cannot be loaded as or cited as the paper checkpoint.",
+  "current_config_fingerprint": "d53396a525bf68cc",
   "config_fingerprint": "814db9d6a32562e0",
   "best_validation_loss": 1030.849609375,
   "samples": 16,

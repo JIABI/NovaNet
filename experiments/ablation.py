@@ -18,9 +18,14 @@ from novanet.policies import NovaNetPolicy
 from novanet.simulation import Scenario, simulate_single_user
 
 from experiments.common import (
+    add_paired_oracle_gap,
     aggregate_rows,
     build_paper_ephemeris,
+    evaluation_episode_seed,
+    evaluation_rng,
     metrics_row,
+    resolve_evaluation_seed,
+    write_protocol,
     write_rows,
 )
 
@@ -33,7 +38,6 @@ DEFAULT_VARIANTS = (
     "Planner",
     "UncLCB",
     "TransTTL",
-    "TransVel",
     "TransHOF",
 )
 
@@ -43,6 +47,7 @@ def main() -> int:
     parser.add_argument("--config", default="configs/paper.yaml")
     parser.add_argument("--checkpoint", default="checkpoints/novanet_paper.pt")
     parser.add_argument("--users", type=int, default=60)
+    parser.add_argument("--evaluation-seed", type=int, default=None)
     parser.add_argument("--variants", default=",".join(DEFAULT_VARIANTS))
     parser.add_argument("--output", default="results/ablation/per_user.csv")
     parser.add_argument("--allow-stale-tle", action="store_true")
@@ -63,7 +68,8 @@ def main() -> int:
         cfg,
         allow_stale_tle=args.allow_stale_tle,
     )
-    rng = np.random.default_rng(cfg.experiment.seed)
+    evaluation_seed = resolve_evaluation_seed(cfg, args.evaluation_seed)
+    rng = evaluation_rng(evaluation_seed)
     scenarios = [
         Scenario(
             latitude_deg=float(rng.uniform(*cfg.experiment.ue_latitude_deg)),
@@ -77,7 +83,12 @@ def main() -> int:
     rows: list[dict] = []
     for variant in variants:
         ablations = () if variant == "Full" else (variant,)
-        policy = NovaNetPolicy(cfg, checkpoint, ablations=ablations)
+        policy = NovaNetPolicy(
+            cfg,
+            checkpoint,
+            ablations=ablations,
+            require_paper_eligible=not args.allow_stale_tle,
+        )
         policy.name = "Full" if variant == "Full" else f"--{variant}"
         for user, scenario in enumerate(scenarios):
             metrics = simulate_single_user(
@@ -85,10 +96,13 @@ def main() -> int:
                 ephemeris,
                 policy,
                 scenario,
-                seed=cfg.experiment.seed + user,
+                seed=evaluation_episode_seed(evaluation_seed, user),
+                compute_oracle_cost=True,
             )
             row = metrics_row(metrics, user)
             row["ablation"] = variant
+            row["evaluation_seed"] = evaluation_seed
+            row["intervention"] = "inference_time_component_bypass"
             rows.append(row)
             print(
                 f"variant={variant:12s} user={user:03d} "
@@ -99,8 +113,33 @@ def main() -> int:
 
     write_rows(args.output, rows)
     summary_path = Path(args.output).with_name("summary.csv")
-    write_rows(summary_path, aggregate_rows(rows, group_key="ablation"))
-    print(f"wrote {args.output} and {summary_path}")
+    summary = aggregate_rows(rows, group_key="ablation")
+    add_paired_oracle_gap(summary)
+    write_rows(summary_path, summary)
+    protocol_path = write_protocol(
+        Path(args.output).with_name("protocol.json"),
+        cfg,
+        runner="ablation",
+        checkpoint=checkpoint,
+        evaluation_seed=evaluation_seed,
+        diagnostic=args.allow_stale_tle,
+        details={
+            "intervention": "inference_time_component_bypass",
+            "retrained_per_variant": False,
+            "training_seed": cfg.experiment.seed,
+            "oracle_reference": (
+                "paired non-causal same-energy replay for every selected "
+                "decision window"
+            ),
+            "orbit_prior_scope": (
+                "zeros the five geometry/dwell encoder channels; "
+                "candidate construction, geometric adjacency, direct TTL, "
+                "and nominal physical SINR remain available"
+            ),
+            "variants": variants,
+        },
+    )
+    print(f"wrote {args.output}, {summary_path}, and {protocol_path}")
     return 0
 
 

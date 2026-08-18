@@ -7,7 +7,7 @@ name = "novanet-handover"
 version = "0.2.0"
 description = "Orbit-aware structured decision learning for LEO handover"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {file = "LICENSE"}
 dependencies = [
   "numpy>=1.24,<3",
@@ -24,6 +24,10 @@ test = ["pytest>=7,<9"]
 
 [tool.setuptools]
 packages = ["novanet"]
+
+[tool.setuptools.data-files]
+"share/novanet/configs" = ["configs/paper.yaml"]
+"share/novanet" = ["starlink.tle"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

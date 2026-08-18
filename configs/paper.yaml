@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 5
 
 experiment:
   seed: 2025
@@ -20,7 +20,9 @@ channel:
   bandwidth_hz: 20000000.0
   bandwidth_options_hz: [20000000.0, 100000000.0]
   eirp_density_dbw_mhz: 34.0
+  ue_antenna_elements: 1
   ue_antenna_gain_dbi: 0.0
+  exogenous_interference_power_w: 0.0
   system_noise_temperature_k: 290.0
   implementation_efficiency: 0.75
   outage_threshold_db: 0.0
@@ -32,7 +34,9 @@ channel:
   shadowing_std_db: 1.5
   measurement_iir_alpha: 0.5
   measurement_interval_s: 30
-  nominal_measurement_std_db: 0.5
+  # The nominal training/evaluation condition adds no report corruption.
+  # Measurement-noise sweeps override this explicitly in their scenarios.
+  nominal_measurement_std_db: 0.0
   doppler_tracking_efficiency: 0.995
   doppler_estimation_std_hz: 25.0
   coherent_integration_s: 1.00e-4
@@ -44,27 +48,38 @@ handover:
   hysteresis_db: 1.5
   freeze_steps: 1
   failure_outage_fraction: 0.5
+  event_step_s: 0.010
 
 planner:
   horizon_steps: 6
   temperature: 1.0
+  policy_temperature: 1.0
+  teacher_temperature: 1.0
   lcb_kappa: 1.5
-  rate_weight: 1.0
-  dwell_weight: 0.35
-  base_switch_cost: 1.0
-  retained_dwell_weight: 0.50
-  angular_speed_weight: 0.25
-  hof_weight: 1.50
+  rate_reference_mbps: 50.0
+  ttl_reference_s: 600.0
+  alpha: 1.0
+  beta: 0.35
+  c0: 1.0
+  c1: 0.50
+  c2: 1.50
   load_weight: 0.50
 
 model:
+  # Retained only for historical top-level imports. It is not concatenated
+  # with the six-dimensional satellite--UE node vector.
   ue_feature_dim: 4
-  node_feature_dim: 9
-  transition_feature_dim: 3
+  node_feature_dim: 6
+  transition_feature_dim: 5
   hidden_dim: 128
   gnn_layers: 2
   graph_neighbors: 4
   adjacency_temperature: 1.0
+  elevation_reference_deg: 90.0
+  elevation_rate_reference_deg_s: 1.0
+  range_reference_m: 2000000.0
+  range_rate_reference_m_s: 10000.0
+  sinr_reference_db: 30.0
 
 training:
   num_samples: 3600
@@ -75,16 +90,9 @@ training:
   weight_decay: 1.00e-4
   gradient_clip: 1.0
   use_amp: false
-  snr_nll_weight: 0.20
-  ttl_weight: 1.00
+  nll_weight: 0.20
   hof_weight: 0.50
   path_weight: 0.50
-  selection_weight: 0.20
-  entropy_weight: 0.01
-  handover_weight_init: 1.0
-  handover_weight_max: 30.0
-  dual_step: 0.05
-  target_switch_rate: 0.04
   checkpoint_path: checkpoints/novanet_paper.pt
 
 traffic:
@@ -105,3 +113,7 @@ multi_ue:
   region_center_lat_deg: 51.5
   region_center_lon_deg: 0.0
   region_radius_km: 500.0
+  # The manuscript denotes this validation-selected constant as c_blk but
+  # does not report its numeric value. Keep it explicit rather than inventing
+  # a value; the multi-UE runner requires an override for manuscript runs.
+  blocking_cost: null
